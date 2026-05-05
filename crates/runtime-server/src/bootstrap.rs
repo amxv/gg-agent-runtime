@@ -9,7 +9,7 @@ use runtime_provider_claude::{ClaudeProviderConfig, ClaudeProviderStub};
 use runtime_provider_codex::{copy_codex_auth_file, CodexProvider, CodexProviderConfig};
 use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
 use runtime_tools::{
-    ProcessManagerConfig, StubProcessManager, StubTeamCommsService, StubToolGateway,
+    ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubTeamCommsService,
     StubWorktreeService, TeamCommsConfig, WorktreeServiceConfig,
 };
 
@@ -73,16 +73,29 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
             .context("failed to register claude provider")?;
     }
 
-    let services = RuntimeServices {
-        store: store.clone(),
-        tool_gateway: Arc::new(StubToolGateway),
-        process_manager: Arc::new(StubProcessManager::new(ProcessManagerConfig {
+    let process_manager = RuntimeProcessManager::new(
+        store.clone(),
+        ProcessManagerConfig {
             enabled: config.processes.enabled,
             max_concurrent: config.processes.max_concurrent,
             default_timeout_ms: config.processes.default_timeout_ms,
             max_output_bytes_per_process: config.processes.max_output_bytes_per_process,
             allow_shell: config.processes.allow_shell,
-        })),
+            completed_retention_ms: 600_000,
+            output_event_sample_bytes: 64 * 1024,
+            log_dir: config
+                .resolve_data_path(&config.data.logs_dir)
+                .join("processes"),
+        },
+    )
+    .await
+    .context("failed to initialize process manager")?;
+    let tool_gateway = Arc::new(RuntimeToolGateway::new(process_manager.clone()));
+
+    let services = RuntimeServices {
+        store: store.clone(),
+        tool_gateway,
+        process_manager,
         team_comms: Arc::new(StubTeamCommsService::new(TeamCommsConfig {
             enabled: true,
             max_pending_deliveries: 10_000,

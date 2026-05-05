@@ -20,7 +20,11 @@ pub use runtime::{
     ApprovalResponseInput, CreateSessionInput, ResumeSessionInput, RuntimeSessionManager,
     SendTurnAccepted, SendTurnInput,
 };
-pub use services::{ProcessManager, RuntimeStore, TeamCommsService, ToolGateway, WorktreeService};
+pub use services::{
+    ProcessDetails, ProcessGetRequest, ProcessKillRequest, ProcessListRequest,
+    ProcessLogReadRequest, ProcessLogsChunk, ProcessManager, ProcessRunRequest, ProcessSummary,
+    RuntimeStore, TeamCommsService, ToolGateway, ToolInvokeRequest, WorktreeService,
+};
 pub use state::{
     ApprovalRecord, CredentialRecord, ManagedWorktreeClaimRecord, ManagedWorktreeRecord,
     NewRuntimeEvent, ProcessRecord, RuntimeEventCriticality, RuntimeEventRecord, RuntimeEventScope,

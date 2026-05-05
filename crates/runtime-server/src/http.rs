@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -9,12 +9,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use runtime_core::{
-    ApprovalResponseInput, CreateSessionInput, ProviderKind, ResumeSessionInput, RuntimeApp,
-    RuntimeError, RuntimeEventRecord, RuntimeSessionManager, SendTurnAccepted, SendTurnInput,
+    ApprovalResponseInput, CreateSessionInput, ProcessGetRequest, ProcessKillRequest,
+    ProcessListRequest, ProcessLogReadRequest, ProcessRunRequest, ProviderKind, ResumeSessionInput,
+    RuntimeApp, RuntimeError, RuntimeEventRecord, RuntimeSessionManager, SendTurnAccepted,
+    SendTurnInput, ToolInvokeRequest,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+
+const MCP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,6 +30,11 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let mcp = Router::new()
+        .route("/capabilities", get(mcp_capabilities))
+        .route("/invoke", post(mcp_invoke))
+        .layer(DefaultBodyLimit::max(MCP_MAX_REQUEST_BODY_BYTES));
+
     let protected = Router::new()
         .route("/health", get(protected_health))
         .route("/providers", get(list_providers))
@@ -49,6 +59,16 @@ pub fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/events/stream",
             get(stream_session_events),
         )
+        .route("/processes", post(start_process).get(list_processes))
+        .route("/processes/{process_id}", get(get_process))
+        .route("/processes/{process_id}/logs", get(get_process_logs))
+        .route("/processes/{process_id}/events", get(replay_process_events))
+        .route(
+            "/processes/{process_id}/events/stream",
+            get(stream_process_events),
+        )
+        .route("/processes/{process_id}/kill", post(kill_process))
+        .nest("/mcp", mcp)
         .route_layer(middleware::from_fn_with_state(
             state.bearer_token.clone(),
             bearer_auth,
@@ -343,6 +363,315 @@ async fn stream_session_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10))))
 }
 
+#[derive(Debug, Deserialize)]
+struct ProcessStartInput {
+    command: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+    session_id: Option<String>,
+}
+
+async fn start_process(
+    State(state): State<AppState>,
+    Json(input): Json<ProcessStartInput>,
+) -> Result<Json<runtime_core::ProcessDetails>, ApiError> {
+    let details = state
+        .app
+        .services
+        .process_manager
+        .run_process(ProcessRunRequest {
+            caller_session_id: input.session_id,
+            tool_call_id: None,
+            command: input.command,
+            cwd: input.cwd,
+            timeout_ms: input.timeout_ms,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(details))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessListQuery {
+    session_id: Option<String>,
+    include_completed: Option<bool>,
+}
+
+async fn list_processes(
+    State(state): State<AppState>,
+    Query(query): Query<ProcessListQuery>,
+) -> Result<Json<Vec<runtime_core::ProcessSummary>>, ApiError> {
+    let rows = state
+        .app
+        .services
+        .process_manager
+        .list_processes(ProcessListRequest {
+            caller_session_id: query.session_id,
+            include_completed: query.include_completed.unwrap_or(true),
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessSessionQuery {
+    session_id: Option<String>,
+}
+
+async fn get_process(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    Query(query): Query<ProcessSessionQuery>,
+) -> Result<Json<runtime_core::ProcessDetails>, ApiError> {
+    let details = state
+        .app
+        .services
+        .process_manager
+        .get_process(ProcessGetRequest {
+            process_id,
+            caller_session_id: query.session_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(details))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessLogsQuery {
+    session_id: Option<String>,
+    stream: Option<String>,
+    head_lines: Option<usize>,
+    tail_lines: Option<usize>,
+    max_bytes: Option<usize>,
+}
+
+async fn get_process_logs(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    Query(query): Query<ProcessLogsQuery>,
+) -> Result<Json<Vec<runtime_core::ProcessLogsChunk>>, ApiError> {
+    let logs = state
+        .app
+        .services
+        .process_manager
+        .read_process_logs(ProcessLogReadRequest {
+            process_id,
+            caller_session_id: query.session_id,
+            stream: query.stream,
+            head_lines: query.head_lines,
+            tail_lines: query.tail_lines,
+            max_bytes: query.max_bytes,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(logs))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessEventsQuery {
+    session_id: Option<String>,
+    after_seq: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn replay_process_events(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    Query(query): Query<ProcessEventsQuery>,
+) -> Result<Json<Vec<RuntimeEventRecord>>, ApiError> {
+    let events = state
+        .app
+        .services
+        .process_manager
+        .replay_events(
+            process_id,
+            query.session_id,
+            query.after_seq,
+            query.limit.unwrap_or(500).min(10_000),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(events))
+}
+
+async fn stream_process_events(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    Query(query): Query<ProcessEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
+{
+    let receiver = state.app.services.process_manager.subscribe_events();
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok());
+    let cursor = query.after_seq.or(last_event_id);
+    let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
+    let mut replay_events = Vec::new();
+    let mut replay_cursor = cursor;
+
+    loop {
+        let page = state
+            .app
+            .services
+            .process_manager
+            .replay_events(
+                process_id.clone(),
+                query.session_id.clone(),
+                replay_cursor,
+                replay_page_limit,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        if page.is_empty() {
+            break;
+        }
+        replay_cursor = page.last().map(|event| event.seq);
+        let page_len = page.len();
+        replay_events.extend(page);
+        if page_len < replay_page_limit {
+            break;
+        }
+    }
+
+    #[cfg(test)]
+    if let Some(delay_ms) = headers
+        .get("x-gg-test-handoff-delay-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+
+    let replay_high_watermark_seq = replay_cursor.or(cursor).unwrap_or(0);
+    let replay_stream = tokio_stream::iter(replay_events.into_iter().filter_map(|event| {
+        let payload = serde_json::to_string(&event).ok()?;
+        Some(Ok(Event::default()
+            .id(event.seq.to_string())
+            .event(event.kind)
+            .data(payload)))
+    }));
+
+    let process_id_for_live = process_id.clone();
+    let live_stream = BroadcastStream::new(receiver).filter_map(move |next| match next {
+        Ok(event)
+            if event.scope == runtime_core::RuntimeEventScope::Process
+                && event.scope_id == process_id_for_live =>
+        {
+            if event.seq <= replay_high_watermark_seq {
+                return None;
+            }
+            let payload = match serde_json::to_string(&event) {
+                Ok(payload) => payload,
+                Err(_) => return None,
+            };
+            Some(Ok(Event::default()
+                .id(event.seq.to_string())
+                .event(event.kind)
+                .data(payload)))
+        }
+        _ => None,
+    });
+    let stream = replay_stream.chain(live_stream);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10))))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessKillInput {
+    session_id: Option<String>,
+    reason: Option<String>,
+}
+
+async fn kill_process(
+    State(state): State<AppState>,
+    Path(process_id): Path<String>,
+    input: Option<Json<ProcessKillInput>>,
+) -> Result<Json<runtime_core::ProcessDetails>, ApiError> {
+    let input = input.map(|Json(value)| value).unwrap_or(ProcessKillInput {
+        session_id: None,
+        reason: None,
+    });
+    let details = state
+        .app
+        .services
+        .process_manager
+        .kill_process(ProcessKillRequest {
+            process_id,
+            caller_session_id: input.session_id,
+            reason: input.reason,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(details))
+}
+
+async fn mcp_capabilities(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let result = state
+        .app
+        .services
+        .tool_gateway
+        .capabilities()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+#[derive(Debug, Deserialize)]
+struct McpInvokeRequest {
+    namespace: Option<String>,
+    #[serde(alias = "toolName")]
+    tool_name: String,
+    #[serde(alias = "callerAgentId")]
+    caller_agent_id: String,
+    #[serde(default, alias = "invocationId")]
+    invocation_id: Option<String>,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+async fn mcp_invoke(
+    State(state): State<AppState>,
+    Json(request): Json<McpInvokeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let caller_session_id = request.caller_agent_id.trim();
+    if caller_session_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "caller_agent_id is required".to_string(),
+        ));
+    }
+    if request.tool_name.trim().is_empty() {
+        return Err(ApiError::bad_request("tool_name is required".to_string()));
+    }
+    let caller_session = state
+        .runtime
+        .get_session(caller_session_id)
+        .await
+        .map_err(ApiError::from)?;
+    if matches!(caller_session.status.as_str(), "closed" | "failed") {
+        return Err(ApiError::bad_request(format!(
+            "caller session {} is not active (status={})",
+            caller_session_id, caller_session.status
+        )));
+    }
+    let result = state
+        .app
+        .services
+        .tool_gateway
+        .invoke_tool(ToolInvokeRequest {
+            namespace: request.namespace,
+            tool_name: request.tool_name,
+            caller_session_id: caller_session_id.to_string(),
+            invocation_id: request.invocation_id,
+            args: request.args,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
 fn parse_provider_kind(value: &str) -> Result<ProviderKind, ApiError> {
     ProviderKind::from_str(value)
         .ok_or_else(|| ApiError::bad_request(format!("unknown provider {}", value)))
@@ -434,7 +763,7 @@ mod tests {
     };
     use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
     use runtime_tools::{
-        ProcessManagerConfig, StubProcessManager, StubTeamCommsService, StubToolGateway,
+        ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubTeamCommsService,
         StubWorktreeService, TeamCommsConfig, WorktreeServiceConfig,
     };
     use std::collections::HashMap;
@@ -677,19 +1006,29 @@ mod tests {
             .register(Arc::new(TestProvider::default()))
             .expect("register test provider");
         let provider_registry = Arc::new(registry);
+        let process_manager = RuntimeProcessManager::new(
+            store.clone(),
+            ProcessManagerConfig {
+                enabled: true,
+                max_concurrent: 1,
+                default_timeout_ms: 60_000,
+                max_output_bytes_per_process: 100_000,
+                allow_shell: false,
+                completed_retention_ms: 600_000,
+                output_event_sample_bytes: 8 * 1024,
+                log_dir: temp_dir.path().join("process-logs"),
+            },
+        )
+        .await
+        .expect("process manager");
+        let tool_gateway = Arc::new(RuntimeToolGateway::new(process_manager.clone()));
 
         let app = runtime_core::RuntimeApp::new(
             provider_registry.clone(),
             runtime_core::RuntimeServices {
                 store: store.clone(),
-                tool_gateway: Arc::new(StubToolGateway),
-                process_manager: Arc::new(StubProcessManager::new(ProcessManagerConfig {
-                    enabled: false,
-                    max_concurrent: 1,
-                    default_timeout_ms: 60_000,
-                    max_output_bytes_per_process: 100_000,
-                    allow_shell: false,
-                })),
+                tool_gateway,
+                process_manager,
                 team_comms: Arc::new(StubTeamCommsService::new(TeamCommsConfig {
                     enabled: true,
                     max_pending_deliveries: 1_000,
@@ -1294,6 +1633,987 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_process_run_and_logs_share_runtime_process_service() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_bytes = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let created: serde_json::Value =
+            serde_json::from_slice(&create_bytes).expect("create json");
+        let session_id = created["id"].as_str().expect("session id").to_string();
+
+        let invoke_body = serde_json::json!({
+            "namespace": "gg_process",
+            "tool_name": "gg_process_run",
+            "caller_agent_id": session_id,
+            "invocation_id": "inv_1",
+            "args": {
+                "command": "echo phase4_mcp_runtime_path"
+            }
+        });
+        let invoke_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/mcp/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(invoke_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(invoke_response.status(), StatusCode::OK);
+        let invoke_bytes = to_bytes(invoke_response.into_body(), usize::MAX)
+            .await
+            .expect("invoke body");
+        let invoke_json: serde_json::Value =
+            serde_json::from_slice(&invoke_bytes).expect("invoke json");
+        assert_eq!(invoke_json["ok"].as_bool(), Some(true));
+        let process_id = invoke_json
+            .pointer("/result/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("process_id")
+            .to_string();
+
+        let mut done = false;
+        for _ in 0..80 {
+            let get_response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{process_id}?session_id={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("get process");
+            assert_eq!(get_response.status(), StatusCode::OK);
+            let get_bytes = to_bytes(get_response.into_body(), usize::MAX)
+                .await
+                .expect("get process body");
+            let process_json: serde_json::Value =
+                serde_json::from_slice(&get_bytes).expect("get process json");
+            let status = process_json
+                .pointer("/process/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(status, "completed" | "failed" | "timed_out" | "killed") {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(done, "process did not reach terminal state");
+
+        let logs_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}/logs?session_id={session_id}&stream=stdout"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("logs response");
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_bytes = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .expect("logs body");
+        let logs_json: serde_json::Value = serde_json::from_slice(&logs_bytes).expect("logs json");
+        let combined = logs_json
+            .as_array()
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|row| row.get("content"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("phase4_mcp_runtime_path"),
+            "expected process output in logs, got {combined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_output_events_are_sampled_while_logs_remain_authoritative() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .expect("create body"),
+        )
+        .expect("create json");
+        let session_id = create_json["id"].as_str().expect("session id").to_string();
+
+        let run_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/processes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "seq 1 2500",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("run process");
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .expect("run body"),
+        )
+        .expect("run json");
+        let process_id = run_json
+            .pointer("/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("process id")
+            .to_string();
+
+        let mut completed = false;
+        for _ in 0..100 {
+            let get_response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{process_id}?session_id={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("get process");
+            assert_eq!(get_response.status(), StatusCode::OK);
+            let process_json: serde_json::Value = serde_json::from_slice(
+                &to_bytes(get_response.into_body(), usize::MAX)
+                    .await
+                    .expect("get body"),
+            )
+            .expect("process json");
+            let status = process_json
+                .pointer("/process/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(status, "completed" | "failed" | "timed_out" | "killed") {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(completed, "process did not reach terminal state");
+
+        let events_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/processes/{process_id}/events?limit=10000"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("events");
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events: Vec<runtime_core::RuntimeEventRecord> = serde_json::from_slice(
+            &to_bytes(events_response.into_body(), usize::MAX)
+                .await
+                .expect("events body"),
+        )
+        .expect("events json");
+        let sampled_output_events = events
+            .iter()
+            .filter(|event| event.kind == "process.output")
+            .count();
+        assert!(
+            sampled_output_events > 0,
+            "expected sampled process.output events"
+        );
+        assert!(
+            sampled_output_events < 2500,
+            "expected output events to be sampled/coalesced"
+        );
+
+        let logs_response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}/logs?session_id={session_id}&stream=stdout&tail_lines=3000"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("logs");
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(logs_response.into_body(), usize::MAX)
+                .await
+                .expect("logs body"),
+        )
+        .expect("logs json");
+        let output = logs_json
+            .as_array()
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|row| row.get("content"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            output.contains("2500"),
+            "expected full stdout log content to remain retrievable"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_http_ownership_enforced_by_session_identity() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_one = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create one");
+        let create_one_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_one.into_body(), usize::MAX)
+                .await
+                .expect("create one body"),
+        )
+        .expect("create one json");
+        let owner_session_id = create_one_json["id"]
+            .as_str()
+            .expect("owner session id")
+            .to_string();
+
+        let create_two = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create two");
+        let create_two_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_two.into_body(), usize::MAX)
+                .await
+                .expect("create two body"),
+        )
+        .expect("create two json");
+        let other_session_id = create_two_json["id"]
+            .as_str()
+            .expect("other session id")
+            .to_string();
+
+        let run_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/processes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "echo owned",
+                            "session_id": owner_session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("run process");
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .expect("run body"),
+        )
+        .expect("run json");
+        let process_id = run_json
+            .pointer("/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("process id")
+            .to_string();
+
+        let unauthorized_get = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}?session_id={other_session_id}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthorized get");
+        assert_eq!(unauthorized_get.status(), StatusCode::BAD_REQUEST);
+
+        let unauthorized_events = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}/events?session_id={other_session_id}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("unauthorized events");
+        assert_eq!(unauthorized_events.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn mcp_body_limit_is_scoped_to_mcp_routes_only() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .expect("create body"),
+        )
+        .expect("create json");
+        let session_id = create_json["id"].as_str().expect("session id").to_string();
+
+        let oversized = "x".repeat(MCP_MAX_REQUEST_BODY_BYTES + 4096);
+        let oversized_mcp = serde_json::json!({
+            "namespace": "gg_process",
+            "tool_name": "gg_process_status",
+            "caller_agent_id": session_id,
+            "args": {
+                "blob": oversized
+            }
+        });
+        let oversized_mcp_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/mcp/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(oversized_mcp.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("oversized mcp response");
+        assert_eq!(
+            oversized_mcp_response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let oversized_metadata = "m".repeat(MCP_MAX_REQUEST_BODY_BYTES + 4096);
+        let non_mcp_large_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {
+                "oversized": oversized_metadata
+            }
+        });
+        let non_mcp_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(non_mcp_large_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("non mcp response");
+        assert_eq!(non_mcp_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn max_concurrent_one_blocks_second_spawn_until_first_finishes() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .expect("create body"),
+        )
+        .expect("create json");
+        let session_id = create_json["id"].as_str().expect("session id").to_string();
+
+        let first_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/processes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "sleep 1",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("first process");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(first_response.into_body(), usize::MAX)
+                .await
+                .expect("first body"),
+        )
+        .expect("first json");
+        let first_process_id = first_json
+            .pointer("/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("first process id")
+            .to_string();
+
+        let second_router = router.clone();
+        let second_token = token.clone();
+        let second_session = session_id.clone();
+        let mut second_handle = tokio::spawn(async move {
+            second_router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/processes")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {second_token}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "command": "seq 1 500000",
+                                "session_id": second_session,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        });
+
+        let early = timeout(Duration::from_millis(150), &mut second_handle).await;
+        assert!(
+            early.is_err(),
+            "second process started too early before slot became available"
+        );
+
+        let mut first_done = false;
+        for _ in 0..80 {
+            let get_response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{first_process_id}?session_id={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("first get");
+            let body = to_bytes(get_response.into_body(), usize::MAX)
+                .await
+                .expect("first get body");
+            let row: serde_json::Value = serde_json::from_slice(&body).expect("first get json");
+            let status = row
+                .pointer("/process/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if status == "completed" {
+                first_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(first_done, "first process did not complete in time");
+
+        let second_response = second_handle
+            .await
+            .expect("second join")
+            .expect("second response");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(second_response.into_body(), usize::MAX)
+                .await
+                .expect("second body"),
+        )
+        .expect("second json");
+        let second_process_id = second_json
+            .pointer("/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("second process id")
+            .to_string();
+
+        let mut second_done = false;
+        for _ in 0..240 {
+            let get_response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{second_process_id}?session_id={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("second get");
+            assert_eq!(get_response.status(), StatusCode::OK);
+            let body = to_bytes(get_response.into_body(), usize::MAX)
+                .await
+                .expect("second get body");
+            let row: serde_json::Value = serde_json::from_slice(&body).expect("second get json");
+            let status = row
+                .pointer("/process/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(status, "completed" | "failed" | "timed_out" | "killed") {
+                second_done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            second_done,
+            "second process did not complete after first released the slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_events_stream_delivers_live_sampled_output() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "test-model",
+            "cwd": null,
+            "permission_mode": null,
+            "metadata": {}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .expect("create body"),
+        )
+        .expect("create json");
+        let session_id = create_json["id"].as_str().expect("session id").to_string();
+
+        let run_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/processes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "seq 1 200000",
+                            "session_id": session_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("run process");
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .expect("run body"),
+        )
+        .expect("run json");
+        let process_id = run_json
+            .pointer("/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("process id")
+            .to_string();
+
+        let replay_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}/events?session_id={session_id}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let replay_events: Vec<runtime_core::RuntimeEventRecord> = serde_json::from_slice(
+            &to_bytes(replay_response.into_body(), usize::MAX)
+                .await
+                .expect("replay body"),
+        )
+        .expect("replay json");
+        let cursor = replay_events.last().map(|event| event.seq).unwrap_or(0);
+
+        let stream_router = router.clone();
+        let stream_token = token.clone();
+        let stream_process_id = process_id.clone();
+        let stream_session_id = session_id.clone();
+        let stream_handle = tokio::spawn(async move {
+            stream_router
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{stream_process_id}/events/stream?session_id={stream_session_id}&after_seq={cursor}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {stream_token}"))
+                        .header("x-gg-test-handoff-delay-ms", "200")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+        });
+
+        let stream_response = stream_handle
+            .await
+            .expect("stream join")
+            .expect("stream response");
+        assert_eq!(stream_response.status(), StatusCode::OK);
+
+        let mut data_stream = stream_response.into_body().into_data_stream();
+        let mut payload = String::new();
+        for _ in 0..60 {
+            let next = timeout(Duration::from_millis(300), data_stream.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => {
+                    payload.push_str(String::from_utf8_lossy(chunk.as_ref()).as_ref());
+                    if payload.contains("event: process.output")
+                        || payload.contains("event: process.completed")
+                    {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            payload.contains("event: process.output")
+                || payload.contains("event: process.completed"),
+            "expected live process event in stream payload: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "real Codex smoke test: requires local ~/.gg/codex/auth.json"]
+    async fn smoke_real_codex_mcp_process_run_with_staged_auth_copy() {
+        let home_dir = std::env::var("HOME").expect("HOME must be set");
+        let source_auth = std::path::PathBuf::from(home_dir)
+            .join(".gg")
+            .join("codex")
+            .join("auth.json");
+        assert!(source_auth.exists(), "missing {}", source_auth.display());
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = RuntimeServerConfig::default();
+        config.data.root_dir = temp_dir.path().to_path_buf();
+        config.providers.claude.enabled = false;
+        config.providers.codex.enabled = true;
+
+        let bootstrapped = bootstrap_runtime(config.clone()).await.expect("bootstrap");
+        let staged_auth = config
+            .resolve_provider_dir("codex")
+            .join("home")
+            .join("auth.json");
+        assert!(staged_auth.exists(), "expected staged auth copy");
+
+        let token = bootstrapped.auth.bearer_token.clone();
+        let router = build_router(AppState {
+            app: bootstrapped.app,
+            runtime: bootstrapped.runtime,
+            bearer_token: token.clone(),
+            public_base_url: bootstrapped.public_base_url,
+        });
+
+        let create_body = serde_json::json!({
+            "provider": "codex",
+            "model": "gpt-5.2-codex",
+            "cwd": temp_dir.path().display().to_string(),
+            "permission_mode": null,
+            "metadata": {"smoke":"phase4_mcp_process"}
+        });
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_response.into_body(), usize::MAX)
+                .await
+                .expect("create body"),
+        )
+        .expect("create json");
+        let session_id = create_json["id"].as_str().expect("session id").to_string();
+
+        let invoke_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/mcp/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "namespace": "gg_process",
+                            "tool_name": "gg_process_run",
+                            "caller_agent_id": session_id,
+                            "invocation_id": "smoke_phase4_mcp",
+                            "args": {
+                                "command": "echo phase4_mcp_smoke_token_74211"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("invoke");
+        assert_eq!(invoke_response.status(), StatusCode::OK);
+        let invoke_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(invoke_response.into_body(), usize::MAX)
+                .await
+                .expect("invoke body"),
+        )
+        .expect("invoke json");
+        assert_eq!(invoke_json["ok"].as_bool(), Some(true));
+        let process_id = invoke_json
+            .pointer("/result/process/process_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("process id")
+            .to_string();
+
+        let mut completed = false;
+        for _ in 0..120 {
+            let get_response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/v1/processes/{process_id}?session_id={session_id}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("get process");
+            assert_eq!(get_response.status(), StatusCode::OK);
+            let process_json: serde_json::Value = serde_json::from_slice(
+                &to_bytes(get_response.into_body(), usize::MAX)
+                    .await
+                    .expect("get body"),
+            )
+            .expect("process json");
+            let status = process_json
+                .pointer("/process/status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if matches!(status, "completed" | "failed" | "timed_out" | "killed") {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(completed, "process did not reach terminal state");
+
+        let logs_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/processes/{process_id}/logs?session_id={session_id}&stream=stdout"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("logs");
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(logs_response.into_body(), usize::MAX)
+                .await
+                .expect("logs body"),
+        )
+        .expect("logs json");
+        let output = logs_json
+            .as_array()
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|row| row.get("content"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            output.contains("phase4_mcp_smoke_token_74211"),
+            "missing expected process output in logs"
+        );
     }
 
     #[tokio::test]
