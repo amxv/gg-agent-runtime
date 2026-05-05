@@ -60,7 +60,7 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     }
 
     let services = RuntimeServices {
-        store,
+        store: store.clone(),
         tool_gateway: Arc::new(StubToolGateway),
         process_manager: Arc::new(StubProcessManager::new(ProcessManagerConfig {
             enabled: config.processes.enabled,
@@ -107,6 +107,9 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     app.initialize()
         .await
         .context("runtime initialization failed")?;
+    let _ = store
+        .hydrate_runtime_state()
+        .context("runtime bootstrap hydration failed")?;
 
     Ok(BootstrappedRuntime {
         app,
