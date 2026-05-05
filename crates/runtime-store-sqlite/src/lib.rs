@@ -573,6 +573,18 @@ impl SqliteRuntimeRepository {
         Ok(())
     }
 
+    pub fn delete_team_member(&self, team_id: &str, agent_id: &str) -> Result<(), RuntimeError> {
+        let connection = open_connection(&self.database_path)?;
+        connection
+            .execute(
+                "DELETE FROM team_members
+                 WHERE team_id = ?1 AND agent_id = ?2",
+                params![team_id, agent_id],
+            )
+            .map_err(|error| db_error("failed deleting team member", error))?;
+        Ok(())
+    }
+
     pub fn upsert_team_message(&self, record: &TeamMessageRecord) -> Result<(), RuntimeError> {
         let mut connection = open_connection(&self.database_path)?;
         let transaction = connection
@@ -1425,6 +1437,10 @@ impl RuntimeStore for SqliteRuntimeStore {
         self.repository.upsert_team_member(record)
     }
 
+    fn delete_team_member(&self, team_id: &str, agent_id: &str) -> Result<(), RuntimeError> {
+        self.repository.delete_team_member(team_id, agent_id)
+    }
+
     fn upsert_team_message(&self, record: &TeamMessageRecord) -> Result<(), RuntimeError> {
         self.repository.upsert_team_message(record)
     }
@@ -2233,6 +2249,75 @@ mod tests {
         assert_eq!(hydrated.sessions[0].id, "session_1");
         assert_eq!(hydrated.turns[0].id, "turn_1");
         assert_eq!(hydrated.teams[0].id, "team_1");
+    }
+
+    #[test]
+    fn delete_team_member_persists_membership_removal() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let repository = repo(&temp_dir);
+        repository.initialize_schema().expect("initialize schema");
+
+        let lead = sample_session();
+        let member = SessionRecord {
+            id: "session_2".to_string(),
+            provider: "codex".to_string(),
+            status: "idle".to_string(),
+            cwd: None,
+            model: Some("gpt-5.2-codex".to_string()),
+            permission_mode: Some("default".to_string()),
+            system_prompt: None,
+            metadata: serde_json::json!({}),
+            provider_session_ref: Some("thread_2".to_string()),
+            canonical_provider_session_ref: None,
+            active_turn_id: None,
+            worktree_id: None,
+            created_at: 200,
+            updated_at: 200,
+            closed_at: None,
+            failure_code: None,
+            failure_message: None,
+        };
+        repository
+            .upsert_session(&lead)
+            .expect("insert lead session");
+        repository
+            .upsert_session(&member)
+            .expect("insert member session");
+
+        repository
+            .upsert_team(&TeamRecord {
+                id: "team_1".to_string(),
+                name: "Team Alpha".to_string(),
+                lead_agent_id: lead.id.clone(),
+                created_by: "user".to_string(),
+                created_at: 201,
+                updated_at: 201,
+                deleted_at: None,
+            })
+            .expect("insert team");
+
+        for agent_id in [&lead.id, &member.id] {
+            repository
+                .upsert_team_member(&TeamMemberRecord {
+                    team_id: "team_1".to_string(),
+                    agent_id: agent_id.to_string(),
+                    title: None,
+                    joined_at: 202,
+                    added_by: "user".to_string(),
+                    creator_agent_id: None,
+                    creator_compaction_subscription: "auto".to_string(),
+                    worktree_id: None,
+                })
+                .expect("insert team member");
+        }
+
+        repository
+            .delete_team_member("team_1", member.id.as_str())
+            .expect("delete team member");
+
+        let hydrated = repository.hydrate_runtime_state().expect("hydrate");
+        assert_eq!(hydrated.team_members.len(), 1);
+        assert_eq!(hydrated.team_members[0].agent_id, lead.id);
     }
 
     #[tokio::test]

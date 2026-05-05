@@ -6,17 +6,21 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use runtime_core::{
     ApprovalResponseInput, CreateSessionInput, ProcessGetRequest, ProcessKillRequest,
     ProcessListRequest, ProcessLogReadRequest, ProcessRunRequest, ProviderKind, ResumeSessionInput,
-    RuntimeApp, RuntimeError, RuntimeEventRecord, RuntimeSessionManager, SendTurnAccepted,
-    SendTurnInput, ToolInvokeRequest,
+    RuntimeApp, RuntimeError, RuntimeEventRecord, RuntimeEventScope, RuntimeSessionManager,
+    SendTurnAccepted, SendTurnInput, TeamBroadcastRequest, TeamCancelMessageRequest,
+    TeamCreateRequest, TeamDeliveryRecord, TeamGetDeliveriesRequest, TeamInterruptAllRequest,
+    TeamJoinRequest, TeamListMessagesRequest, TeamRemoveMemberRequest, TeamRetryDeliveryRequest,
+    TeamSendDirectRequest, TeamSetLeadRequest, TeamViewSnapshotRequest, ToolInvokeRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
 
 const MCP_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -41,6 +45,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/providers/{provider}/models", get(list_provider_models))
         .route("/providers/codex/auth/status", get(codex_auth_status))
         .route("/version", get(version))
+        .route("/events", get(replay_global_events))
+        .route("/events/stream", get(stream_global_events))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
         .route("/sessions/{session_id}/resume", post(resume_session))
@@ -68,6 +74,35 @@ pub fn build_router(state: AppState) -> Router {
             get(stream_process_events),
         )
         .route("/processes/{process_id}/kill", post(kill_process))
+        .route("/teams", post(create_team).get(list_teams))
+        .route("/teams/{team_id}", get(get_team).delete(delete_team))
+        .route("/teams/{team_id}/members", post(join_team_member))
+        .route(
+            "/teams/{team_id}/members/{agent_id}",
+            delete(remove_team_member),
+        )
+        .route("/teams/{team_id}/lead", post(set_team_lead))
+        .route(
+            "/teams/{team_id}/messages",
+            post(send_team_direct).get(list_team_messages),
+        )
+        .route("/teams/{team_id}/broadcasts", post(send_team_broadcast))
+        .route("/teams/{team_id}/deliveries", get(list_team_deliveries))
+        .route(
+            "/teams/{team_id}/deliveries/{delivery_id}/retry",
+            post(retry_team_delivery),
+        )
+        .route(
+            "/teams/{team_id}/messages/{message_id}/cancel",
+            post(cancel_team_message),
+        )
+        .route("/teams/{team_id}/view", get(get_team_view_snapshot))
+        .route("/teams/{team_id}/events", get(replay_team_events))
+        .route("/teams/{team_id}/events/stream", get(stream_team_events))
+        .route(
+            "/teams/{team_id}/interrupt-all",
+            post(interrupt_all_team_turns),
+        )
         .nest("/mcp", mcp)
         .route_layer(middleware::from_fn_with_state(
             state.bearer_token.clone(),
@@ -361,6 +396,554 @@ async fn stream_session_events(
     let stream = replay_stream.chain(live_stream);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10))))
+}
+
+async fn replay_global_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventReplayQuery>,
+) -> Result<Json<Vec<RuntimeEventRecord>>, ApiError> {
+    let events = state
+        .app
+        .services
+        .store
+        .list_runtime_events(
+            None,
+            query.after_seq,
+            query.limit.unwrap_or(500).min(10_000),
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(events))
+}
+
+async fn stream_global_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventReplayQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
+{
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok());
+    let cursor = query.after_seq.or(last_event_id);
+    let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
+    let mut replay_events = Vec::new();
+    let mut replay_cursor = cursor;
+
+    loop {
+        let page = state
+            .app
+            .services
+            .store
+            .list_runtime_events(None, replay_cursor, replay_page_limit)
+            .map_err(ApiError::from)?;
+        if page.is_empty() {
+            break;
+        }
+        replay_cursor = page.last().map(|event| event.row_id);
+        let page_len = page.len();
+        replay_events.extend(page);
+        if page_len < replay_page_limit {
+            break;
+        }
+    }
+
+    let replay_high_watermark_seq = replay_cursor.or(cursor).unwrap_or(0);
+    let replay_stream = tokio_stream::iter(replay_events.into_iter().filter_map(|event| {
+        let payload = serde_json::to_string(&event).ok()?;
+        Some(Ok(Event::default()
+            .id(event.row_id.to_string())
+            .event(event.kind)
+            .data(payload)))
+    }));
+
+    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+    let store = state.app.services.store.clone();
+    tokio::spawn(async move {
+        let mut cursor = replay_high_watermark_seq;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let page = match store.list_runtime_events(None, Some(cursor), replay_page_limit) {
+                Ok(page) => page,
+                Err(_) => continue,
+            };
+            if page.is_empty() {
+                continue;
+            }
+            for event in page {
+                cursor = cursor.max(event.row_id);
+                let payload = match serde_json::to_string(&event) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                let sse = Event::default()
+                    .id(event.row_id.to_string())
+                    .event(event.kind)
+                    .data(payload);
+                if tx.send(Ok(sse)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let live_stream = ReceiverStream::new(rx);
+    let stream = replay_stream.chain(live_stream);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10))))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamCreateInput {
+    name: String,
+    lead_agent_id: String,
+    member_agent_ids: Option<Vec<String>>,
+    created_by: Option<String>,
+}
+
+async fn create_team(
+    State(state): State<AppState>,
+    Json(input): Json<TeamCreateInput>,
+) -> Result<Json<runtime_core::TeamWithMembers>, ApiError> {
+    let team = state
+        .app
+        .services
+        .team_comms
+        .create_team(TeamCreateRequest {
+            name: input.name,
+            lead_agent_id: input.lead_agent_id,
+            member_agent_ids: input.member_agent_ids.unwrap_or_default(),
+            created_by: input.created_by,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(team))
+}
+
+async fn list_teams(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<runtime_core::TeamWithMembers>>, ApiError> {
+    let teams = state
+        .app
+        .services
+        .team_comms
+        .list_teams()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(teams))
+}
+
+async fn get_team(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+) -> Result<Json<runtime_core::TeamWithMembers>, ApiError> {
+    let team = state
+        .app
+        .services
+        .team_comms
+        .get_team(team_id.as_str())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(team))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamJoinInput {
+    agent_id: String,
+    title: Option<String>,
+    added_by: Option<String>,
+    creator_agent_id: Option<String>,
+    creator_compaction_subscription: Option<String>,
+    worktree_id: Option<String>,
+}
+
+async fn join_team_member(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(input): Json<TeamJoinInput>,
+) -> Result<Json<runtime_core::TeamWithMembers>, ApiError> {
+    let team = state
+        .app
+        .services
+        .team_comms
+        .join_team(TeamJoinRequest {
+            team_id,
+            agent_id: input.agent_id,
+            title: input.title,
+            added_by: input.added_by,
+            creator_agent_id: input.creator_agent_id,
+            creator_compaction_subscription: input.creator_compaction_subscription,
+            worktree_id: input.worktree_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(team))
+}
+
+async fn remove_team_member(
+    State(state): State<AppState>,
+    Path((team_id, agent_id)): Path<(String, String)>,
+) -> Result<Json<runtime_core::TeamWithMembers>, ApiError> {
+    let team = state
+        .app
+        .services
+        .team_comms
+        .remove_team_member(TeamRemoveMemberRequest { team_id, agent_id })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(team))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamSetLeadInput {
+    lead_agent_id: String,
+}
+
+async fn set_team_lead(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(input): Json<TeamSetLeadInput>,
+) -> Result<Json<runtime_core::TeamWithMembers>, ApiError> {
+    let team = state
+        .app
+        .services
+        .team_comms
+        .set_team_lead(TeamSetLeadRequest {
+            team_id,
+            lead_agent_id: input.lead_agent_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(team))
+}
+
+async fn delete_team(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .app
+        .services
+        .team_comms
+        .delete_team(team_id.as_str())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDirectInput {
+    sender_agent_id: String,
+    recipient_agent_id: String,
+    input: Value,
+    image_paths: Option<Vec<String>>,
+    priority: Option<String>,
+    policy: Option<String>,
+    correlation_id: Option<String>,
+    reply_to_message_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+async fn send_team_direct(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(input): Json<TeamDirectInput>,
+) -> Result<Json<runtime_core::TeamMessageAck>, ApiError> {
+    let ack = state
+        .app
+        .services
+        .team_comms
+        .send_direct(TeamSendDirectRequest {
+            team_id,
+            sender_agent_id: input.sender_agent_id,
+            recipient_agent_id: input.recipient_agent_id,
+            input: input.input,
+            image_paths: input.image_paths.unwrap_or_default(),
+            priority: input.priority.unwrap_or_else(|| "normal".to_string()),
+            policy: input
+                .policy
+                .unwrap_or_else(|| "non_interrupting".to_string()),
+            correlation_id: input.correlation_id,
+            reply_to_message_id: input.reply_to_message_id,
+            idempotency_key: input.idempotency_key,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ack))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamBroadcastInput {
+    sender_agent_id: String,
+    input: Value,
+    image_paths: Option<Vec<String>>,
+    priority: Option<String>,
+    policy: Option<String>,
+    include_sender: Option<bool>,
+    correlation_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+async fn send_team_broadcast(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Json(input): Json<TeamBroadcastInput>,
+) -> Result<Json<runtime_core::TeamMessageAck>, ApiError> {
+    let ack = state
+        .app
+        .services
+        .team_comms
+        .broadcast(TeamBroadcastRequest {
+            team_id,
+            sender_agent_id: input.sender_agent_id,
+            input: input.input,
+            image_paths: input.image_paths.unwrap_or_default(),
+            priority: input.priority.unwrap_or_else(|| "normal".to_string()),
+            policy: input
+                .policy
+                .unwrap_or_else(|| "non_interrupting".to_string()),
+            include_sender: input.include_sender.unwrap_or(false),
+            correlation_id: input.correlation_id,
+            idempotency_key: input.idempotency_key,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ack))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamListMessagesQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_team_messages(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Query(query): Query<TeamListMessagesQuery>,
+) -> Result<Json<runtime_core::TeamListMessagesResponse>, ApiError> {
+    let response = state
+        .app
+        .services
+        .team_comms
+        .list_messages(TeamListMessagesRequest {
+            team_id,
+            cursor: query.cursor,
+            limit: query.limit,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamDeliveriesQuery {
+    message_id: Option<String>,
+    recipient_agent_id: Option<String>,
+}
+
+async fn list_team_deliveries(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Query(query): Query<TeamDeliveriesQuery>,
+) -> Result<Json<Vec<TeamDeliveryRecord>>, ApiError> {
+    let deliveries = state
+        .app
+        .services
+        .team_comms
+        .get_deliveries(TeamGetDeliveriesRequest {
+            team_id,
+            message_id: query.message_id,
+            recipient_agent_id: query.recipient_agent_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(deliveries))
+}
+
+async fn retry_team_delivery(
+    State(state): State<AppState>,
+    Path((team_id, delivery_id)): Path<(String, String)>,
+) -> Result<Json<TeamDeliveryRecord>, ApiError> {
+    let delivery = state
+        .app
+        .services
+        .team_comms
+        .retry_delivery(TeamRetryDeliveryRequest {
+            team_id,
+            delivery_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(delivery))
+}
+
+async fn cancel_team_message(
+    State(state): State<AppState>,
+    Path((team_id, message_id)): Path<(String, String)>,
+) -> Result<Json<Vec<TeamDeliveryRecord>>, ApiError> {
+    let rows = state
+        .app
+        .services
+        .team_comms
+        .cancel_message(TeamCancelMessageRequest {
+            team_id,
+            message_id,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+struct TeamSnapshotQuery {
+    message_cursor: Option<String>,
+    message_limit: Option<usize>,
+    include_delivery_map: Option<bool>,
+    delivery_recipient_filter: Option<String>,
+}
+
+async fn get_team_view_snapshot(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Query(query): Query<TeamSnapshotQuery>,
+) -> Result<Json<runtime_core::TeamViewSnapshotResponse>, ApiError> {
+    let snapshot = state
+        .app
+        .services
+        .team_comms
+        .get_view_snapshot(TeamViewSnapshotRequest {
+            team_id,
+            message_cursor: query.message_cursor,
+            message_limit: query.message_limit,
+            include_delivery_map: query.include_delivery_map,
+            delivery_recipient_filter: query.delivery_recipient_filter,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(snapshot))
+}
+
+async fn replay_team_events(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Query(query): Query<EventReplayQuery>,
+) -> Result<Json<Vec<RuntimeEventRecord>>, ApiError> {
+    let events = state
+        .app
+        .services
+        .team_comms
+        .replay_team_events(
+            team_id.as_str(),
+            query.after_seq,
+            query.limit.unwrap_or(500).min(10_000),
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(events))
+}
+
+async fn stream_team_events(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+    Query(query): Query<EventReplayQuery>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
+{
+    let _ = state
+        .app
+        .services
+        .team_comms
+        .get_team(team_id.as_str())
+        .await
+        .map_err(ApiError::from)?;
+
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok());
+    let cursor = query.after_seq.or(last_event_id);
+    let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
+    let mut replay_events = Vec::new();
+    let mut replay_cursor = cursor;
+
+    loop {
+        let page = state
+            .app
+            .services
+            .team_comms
+            .replay_team_events(team_id.as_str(), replay_cursor, replay_page_limit)
+            .map_err(ApiError::from)?;
+        if page.is_empty() {
+            break;
+        }
+        replay_cursor = page.last().map(|event| event.seq);
+        let page_len = page.len();
+        replay_events.extend(page);
+        if page_len < replay_page_limit {
+            break;
+        }
+    }
+
+    let replay_high_watermark_seq = replay_cursor.or(cursor).unwrap_or(0);
+    let replay_stream = tokio_stream::iter(replay_events.into_iter().filter_map(|event| {
+        let payload = serde_json::to_string(&event).ok()?;
+        Some(Ok(Event::default()
+            .id(event.seq.to_string())
+            .event(event.kind)
+            .data(payload)))
+    }));
+
+    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+    let team_id_for_live = team_id.clone();
+    let store = state.app.services.store.clone();
+    tokio::spawn(async move {
+        let mut cursor = replay_high_watermark_seq;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let page = match store.list_runtime_events(
+                Some((RuntimeEventScope::Team, team_id_for_live.as_str())),
+                Some(cursor),
+                replay_page_limit,
+            ) {
+                Ok(page) => page,
+                Err(_) => continue,
+            };
+            if page.is_empty() {
+                continue;
+            }
+            for event in page {
+                cursor = cursor.max(event.seq);
+                let payload = match serde_json::to_string(&event) {
+                    Ok(payload) => payload,
+                    Err(_) => continue,
+                };
+                let sse = Event::default()
+                    .id(event.seq.to_string())
+                    .event(event.kind)
+                    .data(payload);
+                if tx.send(Ok(sse)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let live_stream = ReceiverStream::new(rx);
+    let stream = replay_stream.chain(live_stream);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10))))
+}
+
+async fn interrupt_all_team_turns(
+    State(state): State<AppState>,
+    Path(team_id): Path<String>,
+) -> Result<Json<runtime_core::TeamInterruptAllResponse>, ApiError> {
+    let response = state
+        .app
+        .services
+        .team_comms
+        .interrupt_all_team_turns(TeamInterruptAllRequest { team_id })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,12 +1342,12 @@ mod tests {
         ProviderCreateSessionRequest, ProviderInterruptTurnRequest, ProviderMetadata,
         ProviderModel, ProviderResumeSessionRequest, ProviderSendTurnRequest, ProviderSession,
         ProviderTurnAck, ProviderTurnResult, ProviderTurnStatus, ProviderWaitTurnRequest,
-        RuntimeProvider,
+        RuntimeProvider, RuntimeStore, RuntimeTeamCommsConfig, RuntimeTeamCommsService,
     };
     use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
     use runtime_tools::{
-        ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubTeamCommsService,
-        StubWorktreeService, TeamCommsConfig, WorktreeServiceConfig,
+        ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubWorktreeService,
+        WorktreeServiceConfig,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1000,12 +1583,17 @@ mod tests {
         let store = Arc::new(SqliteRuntimeStore::new(SqliteStoreConfig {
             database_path: temp_dir.path().join("runtime.sqlite3"),
         }));
+        store.initialize().await.expect("initialize store");
 
         let mut registry = runtime_core::ProviderRegistry::new();
         registry
             .register(Arc::new(TestProvider::default()))
             .expect("register test provider");
         let provider_registry = Arc::new(registry);
+        let runtime = Arc::new(
+            RuntimeSessionManager::new(store.clone(), provider_registry.clone(), 512)
+                .expect("build runtime"),
+        );
         let process_manager = RuntimeProcessManager::new(
             store.clone(),
             ProcessManagerConfig {
@@ -1022,6 +1610,15 @@ mod tests {
         .await
         .expect("process manager");
         let tool_gateway = Arc::new(RuntimeToolGateway::new(process_manager.clone()));
+        let team_comms = RuntimeTeamCommsService::new(
+            store.clone(),
+            runtime.clone(),
+            RuntimeTeamCommsConfig {
+                enabled: true,
+                max_pending_deliveries: 1_000,
+            },
+        )
+        .expect("team comms");
 
         let app = runtime_core::RuntimeApp::new(
             provider_registry.clone(),
@@ -1029,10 +1626,7 @@ mod tests {
                 store: store.clone(),
                 tool_gateway,
                 process_manager,
-                team_comms: Arc::new(StubTeamCommsService::new(TeamCommsConfig {
-                    enabled: true,
-                    max_pending_deliveries: 1_000,
-                })),
+                team_comms,
                 worktrees: Arc::new(StubWorktreeService::new(WorktreeServiceConfig {
                     enabled: false,
                     root_dir: temp_dir.path().display().to_string(),
@@ -1059,10 +1653,6 @@ mod tests {
         )
         .expect("build app");
         app.initialize().await.expect("initialize app");
-
-        let runtime = Arc::new(
-            RuntimeSessionManager::new(store, provider_registry, 512).expect("build runtime"),
-        );
         let bearer_token = "test-token".to_string();
 
         let router = build_router(AppState {
@@ -3006,5 +3596,966 @@ mod tests {
             .await
             .expect("close response");
         assert_eq!(close_response.status(), StatusCode::OK);
+    }
+
+    async fn create_test_session(router: Router, token: &str, suite: &str) -> String {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "provider": "codex",
+                            "model": "test-model",
+                            "metadata": {"suite": suite}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create session response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("create session body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("create session json");
+        json["id"].as_str().expect("session id").to_string()
+    }
+
+    #[tokio::test]
+    async fn team_routes_lifecycle_and_controls() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let leader_session_id = create_test_session(router.clone(), token.as_str(), "phase5").await;
+        let member_one_session_id =
+            create_test_session(router.clone(), token.as_str(), "phase5").await;
+        let member_two_session_id =
+            create_test_session(router.clone(), token.as_str(), "phase5").await;
+
+        let create_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/teams")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Lifecycle Team",
+                            "lead_agent_id": leader_session_id,
+                            "member_agent_ids": [member_one_session_id]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create team response");
+        assert_eq!(create_team_response.status(), StatusCode::OK);
+        let create_team_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_team_response.into_body(), usize::MAX)
+                .await
+                .expect("create team body"),
+        )
+        .expect("create team json");
+        let team_id = create_team_json["team"]["id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        let list_teams_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/teams")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list teams response");
+        assert_eq!(list_teams_response.status(), StatusCode::OK);
+        let list_teams_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_teams_response.into_body(), usize::MAX)
+                .await
+                .expect("list teams body"),
+        )
+        .expect("list teams json");
+        assert_eq!(list_teams_json.as_array().map(Vec::len), Some(1));
+
+        let get_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("get team response");
+        assert_eq!(get_team_response.status(), StatusCode::OK);
+        let get_team_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(get_team_response.into_body(), usize::MAX)
+                .await
+                .expect("get team body"),
+        )
+        .expect("get team json");
+        assert_eq!(
+            get_team_json["members"].as_array().map(Vec::len),
+            Some(2),
+            "team should include lead plus one member"
+        );
+
+        let join_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/members"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent_id": member_two_session_id,
+                            "title": "Worker"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(join_response.status(), StatusCode::OK);
+
+        let set_lead_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/lead"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "lead_agent_id": member_one_session_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("set lead response");
+        assert_eq!(set_lead_response.status(), StatusCode::OK);
+        let set_lead_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(set_lead_response.into_body(), usize::MAX)
+                .await
+                .expect("set lead body"),
+        )
+        .expect("set lead json");
+        assert_eq!(
+            set_lead_json["team"]["lead_agent_id"].as_str(),
+            Some(member_one_session_id.as_str())
+        );
+
+        let remove_member_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/teams/{team_id}/members/{leader_session_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("remove member response");
+        assert_eq!(remove_member_response.status(), StatusCode::OK);
+        let remove_member_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(remove_member_response.into_body(), usize::MAX)
+                .await
+                .expect("remove member body"),
+        )
+        .expect("remove member json");
+        assert_eq!(
+            remove_member_json["members"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let direct_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/messages"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": member_one_session_id,
+                            "recipient_agent_id": member_two_session_id,
+                            "input": [{"type":"text","text":"phase5 lifecycle direct"}],
+                            "policy": "non_interrupting",
+                            "priority": "normal",
+                            "idempotency_key": "phase5_lifecycle_direct"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("direct response");
+        assert_eq!(direct_response.status(), StatusCode::OK);
+        let direct_ack: serde_json::Value = serde_json::from_slice(
+            &to_bytes(direct_response.into_body(), usize::MAX)
+                .await
+                .expect("direct body"),
+        )
+        .expect("direct ack");
+        let message_id = direct_ack["message"]["id"]
+            .as_str()
+            .expect("message id")
+            .to_string();
+        let delivery_id = direct_ack["deliveries"][0]["id"]
+            .as_str()
+            .expect("delivery id")
+            .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let list_messages_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/messages?limit=10"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list messages response");
+        assert_eq!(list_messages_response.status(), StatusCode::OK);
+        let list_messages_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_messages_response.into_body(), usize::MAX)
+                .await
+                .expect("list messages body"),
+        )
+        .expect("list messages json");
+        assert!(
+            list_messages_json["messages"].as_array().map(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["id"].as_str() == Some(message_id.as_str()))
+            }) == Some(true),
+            "expected direct message in list"
+        );
+
+        let list_deliveries_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/teams/{team_id}/deliveries?message_id={message_id}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("list deliveries response");
+        assert_eq!(list_deliveries_response.status(), StatusCode::OK);
+        let list_deliveries_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_deliveries_response.into_body(), usize::MAX)
+                .await
+                .expect("list deliveries body"),
+        )
+        .expect("list deliveries json");
+        assert!(
+            list_deliveries_json.as_array().map(|rows| !rows.is_empty()) == Some(true),
+            "expected at least one delivery for direct message"
+        );
+
+        let retry_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/teams/{team_id}/deliveries/{delivery_id}/retry"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("retry response");
+        assert!(
+            retry_response.status() == StatusCode::OK
+                || retry_response.status() == StatusCode::BAD_REQUEST,
+            "retry route should be wired and return a domain status"
+        );
+
+        let cancel_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/messages/{message_id}/cancel"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("cancel response");
+        assert!(
+            cancel_response.status() == StatusCode::OK
+                || cancel_response.status() == StatusCode::BAD_REQUEST,
+            "cancel route should be wired and return a domain status"
+        );
+
+        let snapshot_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/view"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("snapshot response");
+        assert_eq!(snapshot_response.status(), StatusCode::OK);
+
+        let interrupt_all_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/interrupt-all"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("interrupt-all response");
+        assert_eq!(interrupt_all_response.status(), StatusCode::OK);
+        let interrupt_all_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(interrupt_all_response.into_body(), usize::MAX)
+                .await
+                .expect("interrupt-all body"),
+        )
+        .expect("interrupt-all json");
+        assert_eq!(
+            interrupt_all_json["team_id"].as_str(),
+            Some(team_id.as_str())
+        );
+
+        let delete_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/teams/{team_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("delete team response");
+        assert_eq!(delete_team_response.status(), StatusCode::NO_CONTENT);
+
+        let get_deleted_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("get deleted team response");
+        assert_eq!(get_deleted_team_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn team_and_global_events_stream_replay_then_live() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let lead_session_id = create_test_session(router.clone(), token.as_str(), "phase5").await;
+        let member_one_session_id =
+            create_test_session(router.clone(), token.as_str(), "phase5").await;
+        let member_two_session_id =
+            create_test_session(router.clone(), token.as_str(), "phase5").await;
+
+        let create_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/teams")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "SSE Team",
+                            "lead_agent_id": lead_session_id,
+                            "member_agent_ids": [member_one_session_id]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create team response");
+        assert_eq!(create_team_response.status(), StatusCode::OK);
+        let create_team_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_team_response.into_body(), usize::MAX)
+                .await
+                .expect("create team body"),
+        )
+        .expect("create team json");
+        let team_id = create_team_json["team"]["id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        let direct_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/messages"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": lead_session_id,
+                            "recipient_agent_id": member_one_session_id,
+                            "input": [{"type":"text","text":"phase5 team stream seed"}],
+                            "policy": "non_interrupting",
+                            "priority": "normal",
+                            "idempotency_key": "phase5_stream_direct_1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("direct response");
+        assert_eq!(direct_response.status(), StatusCode::OK);
+
+        let team_events_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/events"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("team events response");
+        assert_eq!(team_events_response.status(), StatusCode::OK);
+        let team_events: Vec<runtime_core::RuntimeEventRecord> = serde_json::from_slice(
+            &to_bytes(team_events_response.into_body(), usize::MAX)
+                .await
+                .expect("team events body"),
+        )
+        .expect("team events json");
+        assert!(
+            team_events.len() >= 2,
+            "expected at least two team events for replay"
+        );
+        let team_cursor = team_events[0].seq;
+        let replay_team_ids = team_events
+            .iter()
+            .filter(|event| event.seq > team_cursor)
+            .map(|event| event.seq.to_string())
+            .collect::<Vec<_>>();
+
+        let team_stream_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/teams/{team_id}/events/stream?after_seq={team_cursor}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("team stream response");
+        assert_eq!(team_stream_response.status(), StatusCode::OK);
+        let mut team_stream = team_stream_response.into_body().into_data_stream();
+
+        let join_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/members"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent_id": member_two_session_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(join_response.status(), StatusCode::OK);
+
+        let mut team_sse_payload = String::new();
+        let mut observed_team_live = false;
+        for _ in 0..20 {
+            let next = timeout(Duration::from_secs(1), team_stream.next()).await;
+            if let Ok(Some(Ok(chunk))) = next {
+                team_sse_payload.push_str(String::from_utf8_lossy(chunk.as_ref()).as_ref());
+                if replay_team_ids
+                    .iter()
+                    .all(|seq| team_sse_payload.contains(format!("id: {seq}").as_str()))
+                    && team_sse_payload.contains("event: team.member_joined")
+                {
+                    observed_team_live = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            observed_team_live,
+            "expected team stream replay ids and team.member_joined live event in payload: {team_sse_payload}"
+        );
+
+        let global_events_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("global events response");
+        assert_eq!(global_events_response.status(), StatusCode::OK);
+        let global_events: Vec<runtime_core::RuntimeEventRecord> = serde_json::from_slice(
+            &to_bytes(global_events_response.into_body(), usize::MAX)
+                .await
+                .expect("global events body"),
+        )
+        .expect("global events json");
+        assert!(
+            global_events.len() >= 2,
+            "expected at least two global events for replay"
+        );
+        let global_cursor = global_events[0].row_id;
+        let replay_global_ids = global_events
+            .iter()
+            .filter(|event| event.row_id > global_cursor)
+            .map(|event| event.row_id.to_string())
+            .collect::<Vec<_>>();
+
+        let global_stream_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/events/stream?after_seq={global_cursor}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("global stream response");
+        assert_eq!(global_stream_response.status(), StatusCode::OK);
+        let mut global_stream = global_stream_response.into_body().into_data_stream();
+
+        let set_lead_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/lead"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "lead_agent_id": member_one_session_id
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("set lead response");
+        assert_eq!(set_lead_response.status(), StatusCode::OK);
+
+        let mut global_sse_payload = String::new();
+        let mut observed_global_live = false;
+        for _ in 0..20 {
+            let next = timeout(Duration::from_secs(1), global_stream.next()).await;
+            if let Ok(Some(Ok(chunk))) = next {
+                global_sse_payload.push_str(String::from_utf8_lossy(chunk.as_ref()).as_ref());
+                if replay_global_ids
+                    .iter()
+                    .all(|seq| global_sse_payload.contains(format!("id: {seq}").as_str()))
+                    && global_sse_payload.contains("event: team.lead_changed")
+                {
+                    observed_global_live = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            observed_global_live,
+            "expected global stream replay ids and team.lead_changed live event in payload: {global_sse_payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_routes_direct_and_broadcast_create_deliveries_and_snapshot() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let leader_session_id = create_test_session(router.clone(), token.as_str(), "phase5").await;
+        let teammate_session_id =
+            create_test_session(router.clone(), token.as_str(), "phase5").await;
+
+        let create_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/teams")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Phase5 Team",
+                            "lead_agent_id": leader_session_id,
+                            "member_agent_ids": [teammate_session_id]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create team response");
+        assert_eq!(create_team_response.status(), StatusCode::OK);
+        let create_team_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_team_response.into_body(), usize::MAX)
+                .await
+                .expect("create team body"),
+        )
+        .expect("create team json");
+        let team_id = create_team_json
+            .pointer("/team/id")
+            .and_then(serde_json::Value::as_str)
+            .expect("team id")
+            .to_string();
+
+        let direct_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/messages"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": leader_session_id,
+                            "recipient_agent_id": teammate_session_id,
+                            "input": [{"type":"text","text":"phase5 direct hello"}],
+                            "policy": "non_interrupting",
+                            "priority": "normal",
+                            "idempotency_key": "phase5_direct_1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("direct send response");
+        assert_eq!(direct_response.status(), StatusCode::OK);
+
+        let broadcast_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/broadcasts"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": leader_session_id,
+                            "input": [{"type":"text","text":"phase5 broadcast hello"}],
+                            "policy": "start_new_turn_only",
+                            "priority": "normal",
+                            "include_sender": false,
+                            "idempotency_key": "phase5_broadcast_1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("broadcast response");
+        assert_eq!(broadcast_response.status(), StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let deliveries_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/deliveries"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("deliveries response");
+        assert_eq!(deliveries_response.status(), StatusCode::OK);
+        let deliveries: Vec<runtime_core::TeamDeliveryRecord> = serde_json::from_slice(
+            &to_bytes(deliveries_response.into_body(), usize::MAX)
+                .await
+                .expect("deliveries body"),
+        )
+        .expect("deliveries json");
+        assert!(deliveries.len() >= 2, "expected at least two deliveries");
+
+        let snapshot_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/view"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("snapshot response");
+        assert_eq!(snapshot_response.status(), StatusCode::OK);
+        let snapshot_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(snapshot_response.into_body(), usize::MAX)
+                .await
+                .expect("snapshot body"),
+        )
+        .expect("snapshot json");
+        assert!(
+            snapshot_json["messages"]
+                .as_array()
+                .map(|rows| !rows.is_empty())
+                == Some(true),
+            "expected snapshot messages"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "real Codex smoke test: requires local ~/.gg/codex/auth.json"]
+    async fn smoke_real_codex_phase5_team_comms_slice() {
+        let home_dir = std::env::var("HOME").expect("HOME must be set");
+        let source_auth = std::path::PathBuf::from(home_dir)
+            .join(".gg")
+            .join("codex")
+            .join("auth.json");
+        assert!(source_auth.exists(), "missing {}", source_auth.display());
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = RuntimeServerConfig::default();
+        config.data.root_dir = temp_dir.path().to_path_buf();
+        config.providers.claude.enabled = false;
+        config.providers.codex.enabled = true;
+
+        let bootstrapped = bootstrap_runtime(config.clone()).await.expect("bootstrap");
+        let token = bootstrapped.auth.bearer_token.clone();
+        let router = build_router(AppState {
+            app: bootstrapped.app,
+            runtime: bootstrapped.runtime,
+            bearer_token: token.clone(),
+            public_base_url: bootstrapped.public_base_url,
+        });
+
+        let create_session = |router: Router, token: String, cwd: String| async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/sessions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from(
+                            serde_json::json!({
+                                "provider": "codex",
+                                "model": "gpt-5.2-codex",
+                                "cwd": cwd,
+                                "metadata": {"smoke":"phase5_team_comms"}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .expect("create session response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("create body"),
+            )
+            .expect("create json");
+            json["id"].as_str().expect("session id").to_string()
+        };
+
+        let cwd = temp_dir.path().display().to_string();
+        let lead_session_id = create_session(router.clone(), token.clone(), cwd.clone()).await;
+        let member_session_id = create_session(router.clone(), token.clone(), cwd.clone()).await;
+
+        let create_team_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/teams")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Real Codex Team",
+                            "lead_agent_id": lead_session_id,
+                            "member_agent_ids": [member_session_id]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("create team");
+        assert_eq!(create_team_response.status(), StatusCode::OK);
+        let create_team_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(create_team_response.into_body(), usize::MAX)
+                .await
+                .expect("team body"),
+        )
+        .expect("team json");
+        let team_id = create_team_json["team"]["id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        let direct_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/messages"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": lead_session_id,
+                            "recipient_agent_id": member_session_id,
+                            "input": [{"type":"text","text":"Reply only with phase5teamtoken_89321"}],
+                            "policy": "immediate_interrupt",
+                            "priority": "high",
+                            "idempotency_key": "phase5_smoke_direct_1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("direct response");
+        assert_eq!(direct_response.status(), StatusCode::OK);
+
+        let broadcast_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/teams/{team_id}/broadcasts"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sender_agent_id": lead_session_id,
+                            "input": [{"type":"text","text":"Broadcast ack phase5teamtoken_89321"}],
+                            "policy": "start_new_turn_only",
+                            "priority": "normal",
+                            "include_sender": true,
+                            "idempotency_key": "phase5_smoke_broadcast_1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("broadcast response");
+        assert_eq!(broadcast_response.status(), StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let deliveries_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/deliveries"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("deliveries response");
+        assert_eq!(deliveries_response.status(), StatusCode::OK);
+        let deliveries_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(deliveries_response.into_body(), usize::MAX)
+                .await
+                .expect("deliveries body"),
+        )
+        .expect("deliveries json");
+        assert!(
+            deliveries_json.as_array().map(|rows| !rows.is_empty()) == Some(true),
+            "expected non-empty deliveries"
+        );
+
+        let events_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/teams/{team_id}/events"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("events response");
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(events_response.into_body(), usize::MAX)
+                .await
+                .expect("events body"),
+        )
+        .expect("events json");
+        let kinds = events_json
+            .as_array()
+            .into_iter()
+            .flat_map(|events| events.iter())
+            .filter_map(|event| event.get("kind"))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            kinds.iter().any(|kind| *kind == "team_message.created"),
+            "expected team_message.created in team events"
+        );
     }
 }

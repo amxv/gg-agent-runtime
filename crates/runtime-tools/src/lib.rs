@@ -8,7 +8,12 @@ use runtime_core::{
     NewRuntimeEvent, ProcessDetails, ProcessGetRequest, ProcessKillRequest, ProcessListRequest,
     ProcessLogReadRequest, ProcessLogsChunk, ProcessManager, ProcessRecord, ProcessRunRequest,
     ProcessSummary, RuntimeError, RuntimeEventCriticality, RuntimeEventScope, RuntimeStore,
-    TeamCommsService, ToolGateway, ToolInvokeRequest, WorktreeService,
+    TeamBroadcastRequest, TeamCancelMessageRequest, TeamCommsService, TeamCreateRequest,
+    TeamDeliveryRecord, TeamGetDeliveriesRequest, TeamInterruptAllRequest,
+    TeamInterruptAllResponse, TeamJoinRequest, TeamListMessagesRequest, TeamListMessagesResponse,
+    TeamMessageAck, TeamRemoveMemberRequest, TeamRetryDeliveryRequest, TeamSendDirectRequest,
+    TeamSetLeadRequest, TeamViewSnapshotRequest, TeamViewSnapshotResponse, TeamWithMembers,
+    ToolGateway, ToolInvokeRequest, WorktreeService,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1069,6 +1074,140 @@ impl TeamCommsService for StubTeamCommsService {
             "team comms service is disabled".to_string(),
         ))
     }
+
+    async fn create_team(
+        &self,
+        _request: TeamCreateRequest,
+    ) -> Result<TeamWithMembers, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn list_teams(&self) -> Result<Vec<TeamWithMembers>, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn get_team(&self, _team_id: &str) -> Result<TeamWithMembers, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn join_team(&self, _request: TeamJoinRequest) -> Result<TeamWithMembers, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn remove_team_member(
+        &self,
+        _request: TeamRemoveMemberRequest,
+    ) -> Result<TeamWithMembers, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn set_team_lead(
+        &self,
+        _request: TeamSetLeadRequest,
+    ) -> Result<TeamWithMembers, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn delete_team(&self, _team_id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn interrupt_all_team_turns(
+        &self,
+        _request: TeamInterruptAllRequest,
+    ) -> Result<TeamInterruptAllResponse, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn send_direct(
+        &self,
+        _request: TeamSendDirectRequest,
+    ) -> Result<TeamMessageAck, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn broadcast(
+        &self,
+        _request: TeamBroadcastRequest,
+    ) -> Result<TeamMessageAck, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn list_messages(
+        &self,
+        _request: TeamListMessagesRequest,
+    ) -> Result<TeamListMessagesResponse, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn get_deliveries(
+        &self,
+        _request: TeamGetDeliveriesRequest,
+    ) -> Result<Vec<TeamDeliveryRecord>, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn retry_delivery(
+        &self,
+        _request: TeamRetryDeliveryRequest,
+    ) -> Result<TeamDeliveryRecord, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn cancel_message(
+        &self,
+        _request: TeamCancelMessageRequest,
+    ) -> Result<Vec<TeamDeliveryRecord>, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    async fn get_view_snapshot(
+        &self,
+        _request: TeamViewSnapshotRequest,
+    ) -> Result<TeamViewSnapshotResponse, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
+
+    fn replay_team_events(
+        &self,
+        _team_id: &str,
+        _after_seq: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<runtime_core::RuntimeEventRecord>, RuntimeError> {
+        Err(RuntimeError::Unsupported(
+            "team comms service is not implemented".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -1166,6 +1305,10 @@ mod tests {
         }
 
         fn upsert_team_member(&self, _record: &TeamMemberRecord) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn delete_team_member(&self, _team_id: &str, _agent_id: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
 

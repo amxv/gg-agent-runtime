@@ -3,14 +3,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use runtime_core::{
     EventQueueLimits, ProcessLimits, ProviderRegistry, RuntimeApp, RuntimeServices,
-    RuntimeSessionManager, WorktreeSettings,
+    RuntimeSessionManager, RuntimeStore, RuntimeTeamCommsConfig, RuntimeTeamCommsService,
+    WorktreeSettings,
 };
 use runtime_provider_claude::{ClaudeProviderConfig, ClaudeProviderStub};
 use runtime_provider_codex::{copy_codex_auth_file, CodexProvider, CodexProviderConfig};
 use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
 use runtime_tools::{
-    ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubTeamCommsService,
-    StubWorktreeService, TeamCommsConfig, WorktreeServiceConfig,
+    ProcessManagerConfig, RuntimeProcessManager, RuntimeToolGateway, StubWorktreeService,
+    WorktreeServiceConfig,
 };
 
 use crate::config::{ResolvedAuth, RuntimeServerConfig};
@@ -32,6 +33,10 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     let store = Arc::new(SqliteRuntimeStore::new(SqliteStoreConfig {
         database_path: sqlite_path,
     }));
+    store
+        .initialize()
+        .await
+        .context("failed to initialize runtime store")?;
 
     let codex_home = config.resolve_provider_dir("codex").join("home");
     let codex_provider = Arc::new(CodexProvider::new(CodexProviderConfig {
@@ -73,6 +78,16 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
             .context("failed to register claude provider")?;
     }
 
+    let provider_registry = Arc::new(provider_registry);
+    let runtime = Arc::new(
+        RuntimeSessionManager::new(
+            store.clone(),
+            provider_registry.clone(),
+            config.events.live_queue_capacity,
+        )
+        .context("failed to initialize runtime session manager")?,
+    );
+
     let process_manager = RuntimeProcessManager::new(
         store.clone(),
         ProcessManagerConfig {
@@ -91,15 +106,21 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     .await
     .context("failed to initialize process manager")?;
     let tool_gateway = Arc::new(RuntimeToolGateway::new(process_manager.clone()));
+    let team_comms = RuntimeTeamCommsService::new(
+        store.clone(),
+        runtime.clone(),
+        RuntimeTeamCommsConfig {
+            enabled: true,
+            max_pending_deliveries: 10_000,
+        },
+    )
+    .context("failed to initialize team comms service")?;
 
     let services = RuntimeServices {
         store: store.clone(),
         tool_gateway,
         process_manager,
-        team_comms: Arc::new(StubTeamCommsService::new(TeamCommsConfig {
-            enabled: true,
-            max_pending_deliveries: 10_000,
-        })),
+        team_comms,
         worktrees: Arc::new(StubWorktreeService::new(WorktreeServiceConfig {
             enabled: config.worktrees.enabled,
             root_dir: config.resolve_worktree_root().display().to_string(),
@@ -108,7 +129,6 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         })),
     };
 
-    let provider_registry = Arc::new(provider_registry);
     let app = RuntimeApp::new(
         provider_registry.clone(),
         services,
@@ -135,14 +155,6 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     app.initialize()
         .await
         .context("runtime initialization failed")?;
-    let runtime = Arc::new(
-        RuntimeSessionManager::new(
-            store.clone(),
-            provider_registry,
-            config.events.live_queue_capacity,
-        )
-        .context("failed to initialize runtime session manager")?,
-    );
 
     Ok(BootstrappedRuntime {
         app,

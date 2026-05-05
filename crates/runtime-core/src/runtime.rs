@@ -1128,6 +1128,10 @@ mod tests {
             Ok(())
         }
 
+        fn delete_team_member(&self, _team_id: &str, _agent_id: &str) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         fn upsert_team_message(&self, _record: &TeamMessageRecord) -> Result<(), RuntimeError> {
             Ok(())
         }

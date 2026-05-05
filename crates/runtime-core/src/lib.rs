@@ -5,6 +5,7 @@ pub mod provider_registry;
 pub mod runtime;
 pub mod services;
 pub mod state;
+pub mod team_comms;
 
 pub use app::{EventQueueLimits, ProcessLimits, RuntimeApp, RuntimeServices, WorktreeSettings};
 pub use error::RuntimeError;
@@ -23,7 +24,12 @@ pub use runtime::{
 pub use services::{
     ProcessDetails, ProcessGetRequest, ProcessKillRequest, ProcessListRequest,
     ProcessLogReadRequest, ProcessLogsChunk, ProcessManager, ProcessRunRequest, ProcessSummary,
-    RuntimeStore, TeamCommsService, ToolGateway, ToolInvokeRequest, WorktreeService,
+    RuntimeStore, TeamBroadcastRequest, TeamCancelMessageRequest, TeamCommsService,
+    TeamCreateRequest, TeamGetDeliveriesRequest, TeamInterruptAllRequest, TeamInterruptAllResponse,
+    TeamJoinRequest, TeamListMessagesRequest, TeamListMessagesResponse, TeamMessageAck,
+    TeamRemoveMemberRequest, TeamRetryDeliveryRequest, TeamSendDirectRequest, TeamSetLeadRequest,
+    TeamViewSnapshotRequest, TeamViewSnapshotResponse, TeamWithMembers, ToolGateway,
+    ToolInvokeRequest, WorktreeService,
 };
 pub use state::{
     ApprovalRecord, CredentialRecord, ManagedWorktreeClaimRecord, ManagedWorktreeRecord,
@@ -31,3 +37,4 @@ pub use state::{
     RuntimeHydratedState, SessionRecord, TeamDeliveryRecord, TeamMemberRecord, TeamMessageRecord,
     TeamOperationDiagnosticRecord, TeamOperationJournalRecord, TeamRecord, TurnRecord,
 };
+pub use team_comms::{RuntimeTeamCommsConfig, RuntimeTeamCommsService};
