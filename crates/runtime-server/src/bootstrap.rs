@@ -3,10 +3,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use runtime_core::{
     EventQueueLimits, ProcessLimits, ProviderRegistry, RuntimeApp, RuntimeServices,
-    WorktreeSettings,
+    RuntimeSessionManager, WorktreeSettings,
 };
 use runtime_provider_claude::{ClaudeProviderConfig, ClaudeProviderStub};
-use runtime_provider_codex::{CodexProviderConfig, CodexProviderStub};
+use runtime_provider_codex::{copy_codex_auth_file, CodexProvider, CodexProviderConfig};
 use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
 use runtime_tools::{
     ProcessManagerConfig, StubProcessManager, StubTeamCommsService, StubToolGateway,
@@ -18,6 +18,7 @@ use crate::config::{ResolvedAuth, RuntimeServerConfig};
 #[derive(Clone)]
 pub struct BootstrappedRuntime {
     pub app: Arc<RuntimeApp>,
+    pub runtime: Arc<RuntimeSessionManager>,
     pub auth: ResolvedAuth,
     pub bind_address: String,
     pub public_base_url: String,
@@ -32,12 +33,25 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         database_path: sqlite_path,
     }));
 
-    let codex_provider = Arc::new(CodexProviderStub::new(CodexProviderConfig {
+    let codex_home = config.resolve_provider_dir("codex").join("home");
+    let codex_provider = Arc::new(CodexProvider::new(CodexProviderConfig {
         enabled: config.providers.codex.enabled,
-        home_dir: config.resolve_provider_dir("codex").join("home"),
+        home_dir: codex_home.clone(),
         max_transports: config.providers.codex.max_instances,
         max_sessions_per_transport: config.providers.codex.max_sessions_per_instance,
     }));
+
+    if config.providers.codex.enabled {
+        let default_auth_source = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|path| path.join(".gg").join("codex").join("auth.json"));
+        if let Some(source_auth_path) = default_auth_source.as_ref() {
+            if source_auth_path.exists() {
+                copy_codex_auth_file(source_auth_path, codex_home.as_path())
+                    .context("failed to stage codex auth.json into runtime provider home")?;
+            }
+        }
+    }
 
     let claude_provider = Arc::new(ClaudeProviderStub::new(ClaudeProviderConfig {
         enabled: config.providers.claude.enabled,
@@ -81,8 +95,9 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         })),
     };
 
+    let provider_registry = Arc::new(provider_registry);
     let app = RuntimeApp::new(
-        Arc::new(provider_registry),
+        provider_registry.clone(),
         services,
         EventQueueLimits {
             live_queue_capacity: config.events.live_queue_capacity,
@@ -107,12 +122,18 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     app.initialize()
         .await
         .context("runtime initialization failed")?;
-    let _ = store
-        .hydrate_runtime_state()
-        .context("runtime bootstrap hydration failed")?;
+    let runtime = Arc::new(
+        RuntimeSessionManager::new(
+            store.clone(),
+            provider_registry,
+            config.events.live_queue_capacity,
+        )
+        .context("failed to initialize runtime session manager")?,
+    );
 
     Ok(BootstrappedRuntime {
         app,
+        runtime,
         auth,
         bind_address: config.server.bind_address,
         public_base_url: config.server.public_base_url,

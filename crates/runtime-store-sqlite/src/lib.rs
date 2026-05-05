@@ -1388,6 +1388,69 @@ impl RuntimeStore for SqliteRuntimeStore {
             .map_err(|error| db_error("sqlite healthcheck query failed", error))?;
         Ok(())
     }
+
+    fn append_runtime_event(
+        &self,
+        event: &NewRuntimeEvent,
+    ) -> Result<RuntimeEventRecord, RuntimeError> {
+        self.repository.append_runtime_event(event)
+    }
+
+    fn list_runtime_events(
+        &self,
+        scope: Option<(RuntimeEventScope, &str)>,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<RuntimeEventRecord>, RuntimeError> {
+        self.repository.list_runtime_events(scope, after_seq, limit)
+    }
+
+    fn upsert_session(&self, record: &SessionRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_session(record)
+    }
+
+    fn upsert_turn(&self, record: &TurnRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_turn(record)
+    }
+
+    fn upsert_approval(&self, record: &ApprovalRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_approval(record)
+    }
+
+    fn upsert_team(&self, record: &TeamRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_team(record)
+    }
+
+    fn upsert_team_member(&self, record: &TeamMemberRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_team_member(record)
+    }
+
+    fn upsert_team_message(&self, record: &TeamMessageRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_team_message(record)
+    }
+
+    fn upsert_team_delivery(&self, record: &TeamDeliveryRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_team_delivery(record)
+    }
+
+    fn upsert_managed_worktree(&self, record: &ManagedWorktreeRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_managed_worktree(record)
+    }
+
+    fn upsert_managed_worktree_claim(
+        &self,
+        record: &ManagedWorktreeClaimRecord,
+    ) -> Result<(), RuntimeError> {
+        self.repository.upsert_managed_worktree_claim(record)
+    }
+
+    fn upsert_process(&self, record: &ProcessRecord) -> Result<(), RuntimeError> {
+        self.repository.upsert_process(record)
+    }
+
+    fn hydrate_runtime_state(&self) -> Result<RuntimeHydratedState, RuntimeError> {
+        self.repository.hydrate_runtime_state()
+    }
 }
 
 fn open_connection(path: &Path) -> Result<Connection, RuntimeError> {

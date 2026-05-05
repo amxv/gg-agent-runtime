@@ -24,6 +24,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         app: bootstrapped.app,
+        runtime: bootstrapped.runtime,
         bearer_token: bootstrapped.auth.bearer_token,
         public_base_url: bootstrapped.public_base_url,
     };
