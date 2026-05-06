@@ -158,5 +158,6 @@ export async function runTurnDeterministic(
     turnId,
     status: 'completed',
     usage: usageForPrompt(effectivePrompt),
+    assistantText: delta,
   })
 }

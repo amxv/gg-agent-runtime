@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::openapi::generated_openapi_yaml;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, Request, StatusCode};
@@ -60,6 +61,7 @@ pub fn build_router(state: AppState) -> Router {
             post(claude_auth_import_file),
         )
         .route("/providers/claude/auth/logout", post(claude_auth_logout))
+        .route("/openapi.yaml", get(openapi_yaml))
         .route("/version", get(version))
         .route("/events", get(replay_global_events))
         .route("/events/stream", get(stream_global_events))
@@ -143,8 +145,16 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/openapi.yaml", get(openapi_yaml))
         .nest("/v1", protected)
         .with_state(state)
+}
+
+async fn openapi_yaml() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
+        generated_openapi_yaml(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -2845,6 +2855,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openapi_yaml_route_serves_snapshot() {
+        let (router, token, _temp_dir) = build_test_router().await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.yaml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("openapi response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("openapi body");
+        let body = String::from_utf8(payload.to_vec()).expect("openapi utf8");
+        assert!(body.contains("openapi: 3.1.0"));
+        assert!(body.contains("/v1/sessions"));
+        assert!(body.contains("/v1/events/stream"));
+
+        let protected_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/openapi.yaml")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("protected openapi response");
+        assert_eq!(protected_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn session_stream_replays_exhaustive_backlog_across_pages() {
         let (router, token, _temp_dir) = build_test_router().await;
 
@@ -3448,11 +3494,13 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires local Claude auth sources at ~/.claude/.credentials.json and ~/.gg/claude/.claude.json (or ~/.claude.json fallback)"]
-    async fn ignored_real_claude_http_smoke_exercises_mcp_with_gg_mcp_enabled() {
+    async fn ignored_real_claude_http_smoke_host_credentials_mcp_turn_complete() {
         let prior_bridge_home_override = std::env::var_os("GG_CLAUDE_BRIDGE_HOME");
         let prior_bridge_config_override = std::env::var_os("GG_CLAUDE_BRIDGE_CLAUDE_CONFIG_DIR");
+        let prior_force_oauth_export = std::env::var_os("GG_CLAUDE_BRIDGE_FORCE_OAUTH_TOKEN");
         std::env::remove_var("GG_CLAUDE_BRIDGE_HOME");
         std::env::remove_var("GG_CLAUDE_BRIDGE_CLAUDE_CONFIG_DIR");
+        std::env::remove_var("GG_CLAUDE_BRIDGE_FORCE_OAUTH_TOKEN");
 
         let home_dir = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -3482,6 +3530,13 @@ mod tests {
             "Claude smoke config source path must exist: {}",
             config_source_path.display()
         );
+        std::env::set_var("GG_CLAUDE_BRIDGE_HOME", home_dir.display().to_string());
+        if let Some(config_source_dir) = config_source_path.parent() {
+            std::env::set_var(
+                "GG_CLAUDE_BRIDGE_CLAUDE_CONFIG_DIR",
+                config_source_dir.display().to_string(),
+            );
+        }
 
         let claude_bridge_command_path = standalone_claude_bridge_command_path();
         let gg_mcp_command_path = standalone_gg_mcp_server_command_path();
@@ -3501,6 +3556,7 @@ mod tests {
         config.data.root_dir = temp_dir.path().to_path_buf();
         config.providers.codex.enabled = false;
         config.providers.claude.enabled = true;
+        config.providers.claude_auth_mode = "host_machine".to_string();
         config.processes.enabled = true;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3522,7 +3578,7 @@ mod tests {
             let _ = axum::serve(listener, smoke_server_router).await;
         });
 
-        let auth_status_response = router
+        let initial_auth_status_response = router
             .clone()
             .oneshot(
                 Request::builder()
@@ -3533,20 +3589,20 @@ mod tests {
             )
             .await
             .expect("auth status response");
-        assert_eq!(auth_status_response.status(), StatusCode::OK);
-        let auth_status_json: serde_json::Value = serde_json::from_slice(
-            &to_bytes(auth_status_response.into_body(), usize::MAX)
+        assert_eq!(initial_auth_status_response.status(), StatusCode::OK);
+        let initial_auth_status_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(initial_auth_status_response.into_body(), usize::MAX)
                 .await
                 .expect("auth status body"),
         )
         .expect("auth status json");
         assert_eq!(
-            auth_status_json["authenticated"],
+            initial_auth_status_json["authenticated"],
             true,
-            "Claude auth status should be authenticated for canonical-path smoke setup; credentials_source_path={} config_source_path={} detail={}",
+            "host-machine mode should resolve authenticated state from host login; credentials_source_path={} config_source_path={} detail={}",
             credentials_source_path.display(),
             config_source_path.display(),
-            auth_status_json["detail"]
+            initial_auth_status_json["detail"]
         );
 
         let smoke_model = std::env::var("GG_CLAUDE_SMOKE_MODEL")
@@ -3599,9 +3655,11 @@ mod tests {
             .to_string();
 
         let marker_path = temp_dir.path().join("mcp-smoke-marker.txt");
+        let marker_path_display = marker_path.display().to_string();
+        let marker_token = "CLAUDE_MCP_HTTP_SMOKE_MARKER_47290";
+        let completion_token = "CLAUDE_HTTP_SMOKE_OK_92174";
         let tool_prompt = format!(
-            "Use tool gg_process_run to execute this exact command and nothing else: touch {}\nAfter the tool call, reply with exactly: MCP_SMOKE_DONE",
-            marker_path.display()
+            "Use the gg_process_run tool exactly once to run this command: printf '{marker_token}\\n' > '{marker_path_display}'. After the tool completes, reply with exactly: {completion_token}"
         );
 
         let send_turn_response = router
@@ -3647,7 +3705,8 @@ mod tests {
             .unwrap_or(300);
         let deadline = std::time::Instant::now() + Duration::from_secs(max_wait_secs.max(30));
         let mut saw_terminal_event = false;
-        let mut terminal_last_message: Option<String> = None;
+        let mut terminal_kind: Option<String> = None;
+        let mut terminal_text: Option<String> = None;
         let mut accepted_approvals = std::collections::BTreeSet::new();
         let mut event_cursor: Option<i64> = None;
         let smoke_debug = std::env::var("GG_CLAUDE_SMOKE_DEBUG")
@@ -3769,12 +3828,34 @@ mod tests {
                 }
                 if matches!(kind, "turn.completed" | "turn.failed" | "turn.interrupted") {
                     saw_terminal_event = true;
-                    terminal_last_message = event
+                    terminal_kind = Some(kind.to_string());
+                    terminal_text = event
                         .get("payload")
-                        .and_then(|payload| payload.get("usage"))
-                        .and_then(|usage| usage.get("last_message"))
+                        .and_then(|payload| {
+                            payload
+                                .get("assistant_text")
+                                .or_else(|| payload.get("assistantText"))
+                        })
                         .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            event
+                                .get("payload")
+                                .and_then(|payload| payload.get("usage"))
+                                .and_then(|usage| {
+                                    usage
+                                        .get("last_message")
+                                        .or_else(|| usage.get("lastMessage"))
+                                        .or_else(|| usage.get("assistant_text"))
+                                        .or_else(|| usage.get("assistantText"))
+                                })
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                        });
                     break;
                 }
             }
@@ -3813,17 +3894,27 @@ mod tests {
             session_snapshot_status,
             session_snapshot
         );
+        assert_eq!(
+            terminal_kind.as_deref(),
+            Some("turn.completed"),
+            "Claude HTTP smoke turn should complete successfully"
+        );
+        let terminal_text = terminal_text.unwrap_or_default();
+        assert!(
+            terminal_text.contains(completion_token),
+            "Claude HTTP smoke terminal text missing expected token; terminal_text={terminal_text}"
+        );
         assert!(
             marker_path.exists(),
             "expected Claude MCP tool call to create marker file {}",
             marker_path.display()
         );
-        if let Some(last_message) = terminal_last_message.as_deref() {
-            assert!(
-                last_message.contains("MCP_SMOKE_DONE"),
-                "Claude terminal message did not acknowledge MCP flow: {last_message}"
-            );
-        }
+        let marker_contents = std::fs::read_to_string(&marker_path).unwrap_or_default();
+        assert!(
+            marker_contents.contains(marker_token),
+            "expected marker file to contain token {}; contents={marker_contents}",
+            marker_token
+        );
 
         let close_response = router
             .oneshot(
@@ -3845,6 +3936,10 @@ mod tests {
         match prior_bridge_config_override {
             Some(value) => std::env::set_var("GG_CLAUDE_BRIDGE_CLAUDE_CONFIG_DIR", value),
             None => std::env::remove_var("GG_CLAUDE_BRIDGE_CLAUDE_CONFIG_DIR"),
+        }
+        match prior_force_oauth_export {
+            Some(value) => std::env::set_var("GG_CLAUDE_BRIDGE_FORCE_OAUTH_TOKEN", value),
+            None => std::env::remove_var("GG_CLAUDE_BRIDGE_FORCE_OAUTH_TOKEN"),
         }
     }
 
@@ -4849,7 +4944,7 @@ mod tests {
 
         let create_body = serde_json::json!({
             "provider": "codex",
-            "model": "gpt-5.2-codex",
+            "model": codex_test_model(),
             "cwd": temp_dir.path().display().to_string(),
             "permission_mode": null,
             "metadata": {"smoke":"phase4_mcp_process"}
@@ -5042,9 +5137,10 @@ mod tests {
             "expected codex auth to be authenticated"
         );
 
+        let smoke_model = codex_test_model();
         let create_body = serde_json::json!({
             "provider": "codex",
-            "model": "gpt-5.2-codex",
+            "model": smoke_model,
             "cwd": temp_dir.path().display().to_string(),
             "permission_mode": null,
             "metadata": {
@@ -5160,6 +5256,15 @@ mod tests {
             .await
             .expect("second send response");
         assert_eq!(second_send_response.status(), StatusCode::OK);
+        let second_send_bytes = to_bytes(second_send_response.into_body(), usize::MAX)
+            .await
+            .expect("second send body");
+        let second_accepted_turn: serde_json::Value =
+            serde_json::from_slice(&second_send_bytes).expect("second send json");
+        let second_turn_id = second_accepted_turn["turn_id"]
+            .as_str()
+            .expect("second turn id")
+            .to_string();
 
         let mut second_finished = false;
         for _attempt in 0..80 {
@@ -5207,34 +5312,59 @@ mod tests {
             .await
             .expect("events body");
         let events: serde_json::Value = serde_json::from_slice(&events_bytes).expect("events json");
-        let kinds = events
-            .as_array()
-            .expect("events array")
-            .iter()
-            .filter_map(|event| event.get("kind").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>();
+        let tracked_turn_ids = [turn_id.as_str(), second_turn_id.as_str()];
+        let events_array = events.as_array().expect("events array");
+        let mut completed_messages = std::collections::BTreeMap::<String, String>::new();
+        let mut failed_or_interrupted = Vec::new();
+        for event in events_array {
+            let Some(kind) = event.get("kind").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(event_turn_id) = event.get("turn_id").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if !tracked_turn_ids.contains(&event_turn_id) {
+                continue;
+            }
+            match kind {
+                "turn.completed" => {
+                    let last_message = event
+                        .get("payload")
+                        .and_then(|payload| payload.get("usage"))
+                        .and_then(|usage| usage.get("last_message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    completed_messages.insert(event_turn_id.to_string(), last_message);
+                }
+                "turn.failed" | "turn.interrupted" => {
+                    failed_or_interrupted.push(format!("{event_turn_id}:{kind}"));
+                }
+                _ => {}
+            }
+        }
         assert!(
-            kinds.contains(&"turn.started"),
-            "missing turn.started event"
+            failed_or_interrupted.is_empty(),
+            "real codex runtime smoke observed non-success terminal turns: {:?}",
+            failed_or_interrupted
         );
-        assert!(
-            kinds.contains(&"turn.completed")
-                || kinds.contains(&"turn.failed")
-                || kinds.contains(&"turn.interrupted"),
-            "missing terminal turn event for {}",
-            turn_id
-        );
-        let terminal_count_before_restart = kinds
-            .iter()
-            .filter(|kind| {
-                **kind == "turn.completed"
-                    || **kind == "turn.failed"
-                    || **kind == "turn.interrupted"
-            })
-            .count();
-        assert!(
-            terminal_count_before_restart >= 2,
-            "expected at least two terminal turns before restart"
+        for tracked_turn in tracked_turn_ids {
+            let last_message = completed_messages
+                .get(tracked_turn)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                last_message.contains("phase3token_94731"),
+                "turn {} did not complete with expected token; last_message={}",
+                tracked_turn,
+                last_message
+            );
+        }
+        assert_eq!(
+            completed_messages.len(),
+            2,
+            "expected exactly two successful completed turns before restart"
         );
 
         // Simulate restart and verify persisted session can be resumed and used.
@@ -5268,7 +5398,7 @@ mod tests {
             "input": [
                 {
                     "type": "text",
-                    "text": "After resume, what exact token did you output earlier? Reply with only the token."
+                    "text": "After resume, reply with exactly this token and nothing else: phase3token_94731"
                 }
             ],
             "expected_turn_id": null,
@@ -5288,6 +5418,15 @@ mod tests {
             .await
             .expect("third send response");
         assert_eq!(third_send_response.status(), StatusCode::OK);
+        let third_send_bytes = to_bytes(third_send_response.into_body(), usize::MAX)
+            .await
+            .expect("third send body");
+        let third_accepted_turn: serde_json::Value =
+            serde_json::from_slice(&third_send_bytes).expect("third send json");
+        let third_turn_id = third_accepted_turn["turn_id"]
+            .as_str()
+            .expect("third turn id")
+            .to_string();
 
         let mut third_finished = false;
         for _attempt in 0..80 {
@@ -5348,17 +5487,47 @@ mod tests {
             resumed_kinds.iter().any(|kind| kind == "session.resumed"),
             "expected session.resumed event after explicit resume"
         );
+        let resumed_events_array = resumed_events.as_array().expect("resumed events array");
+        let resumed_completion = resumed_events_array
+            .iter()
+            .filter(|event| {
+                event
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value == third_turn_id)
+            })
+            .find_map(|event| {
+                let kind = event.get("kind").and_then(serde_json::Value::as_str)?;
+                if !matches!(kind, "turn.completed" | "turn.failed" | "turn.interrupted") {
+                    return None;
+                }
+                let last_message = event
+                    .get("payload")
+                    .and_then(|payload| payload.get("usage"))
+                    .and_then(|usage| usage.get("last_message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some((kind.to_string(), last_message))
+            });
+        let (resume_kind, resume_message) =
+            resumed_completion.expect("expected resumed turn terminal event");
+        assert_eq!(
+            resume_kind, "turn.completed",
+            "resumed turn must complete successfully"
+        );
+        assert!(
+            resume_message.contains("phase3token_94731"),
+            "resumed turn completion missing expected token; last_message={resume_message}"
+        );
+
         let terminal_count_after_resume = resumed_kinds
             .iter()
-            .filter(|kind| {
-                kind.as_str() == "turn.completed"
-                    || kind.as_str() == "turn.failed"
-                    || kind.as_str() == "turn.interrupted"
-            })
+            .filter(|kind| kind.as_str() == "turn.completed")
             .count();
         assert!(
             terminal_count_after_resume >= 3,
-            "expected another terminal turn after resume"
+            "expected three successful completed turns after resume"
         );
 
         let close_response = restarted_router
@@ -5387,7 +5556,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "provider": "codex",
-                            "model": "test-model",
+                            "model": codex_test_model(),
                             "metadata": {"suite": suite}
                         })
                         .to_string(),
@@ -5402,6 +5571,14 @@ mod tests {
             .expect("create session body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("create session json");
         json["id"].as_str().expect("session id").to_string()
+    }
+
+    fn codex_test_model() -> String {
+        std::env::var("GG_CODEX_SMOKE_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "gpt-5.4-mini".to_string())
     }
 
     #[tokio::test]
@@ -6176,7 +6353,7 @@ mod tests {
                         .body(Body::from(
                             serde_json::json!({
                                 "provider": "codex",
-                                "model": "gpt-5.2-codex",
+                                "model": codex_test_model(),
                                 "cwd": cwd,
                                 "metadata": {"smoke":"phase5_team_comms"}
                             })
@@ -6805,7 +6982,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "provider": "codex",
-                            "model": "gpt-5.2-codex",
+                            "model": codex_test_model(),
                             "cwd": repo_dir.display().to_string(),
                             "metadata": {"smoke":"phase6"}
                         })
@@ -6867,7 +7044,7 @@ mod tests {
                         serde_json::json!({
                             "source_session_id": lead_session_id,
                             "provider": "codex",
-                            "model": "gpt-5.2-codex",
+                            "model": codex_test_model(),
                             "title": "Phase 6 Implementer",
                             "prompt": "Execute phase 6 smoke instructions.",
                             "worktree": {

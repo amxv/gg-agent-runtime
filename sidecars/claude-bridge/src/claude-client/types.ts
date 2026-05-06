@@ -132,12 +132,15 @@ export interface ClaudeTurnUsage {
   cacheCreationInputTokens?: number
   cacheReadInputTokens?: number
   contextWindowSize?: number
+  last_message?: string
+  lastMessage?: string
 }
 
 export interface ClaudeTurnResult {
   turnId: string
   status: TurnTerminalStatus
   usage?: ClaudeTurnUsage
+  assistantText?: string
 }
 
 export type ClaudeBridgeEventCallback = (event: {

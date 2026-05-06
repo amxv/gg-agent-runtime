@@ -1150,39 +1150,54 @@ export class ClaudeClient {
   }
 
   private completeTurn(session: SessionState, result: ClaudeTurnResult): void {
-    if (result.usage) {
-      session.lastKnownUsage = result.usage
+    const assistantText =
+      typeof result.assistantText === 'string' &&
+      result.assistantText.trim().length > 0
+        ? result.assistantText.trim()
+        : undefined
+    const normalizedResult: ClaudeTurnResult = {
+      ...result,
+      assistantText,
     }
-    if (!session.turnOrder.includes(result.turnId)) {
-      session.turnOrder.push(result.turnId)
+
+    if (normalizedResult.usage) {
+      session.lastKnownUsage = normalizedResult.usage
     }
-    session.turnResults.set(result.turnId, result)
-    session.turnToolItems.delete(result.turnId)
-    this.resolvePendingApprovalsForTurn(session, result.turnId, 'decline')
-    const promptStream = session.turnPromptStreams.get(result.turnId)
+    if (!session.turnOrder.includes(normalizedResult.turnId)) {
+      session.turnOrder.push(normalizedResult.turnId)
+    }
+    session.turnResults.set(normalizedResult.turnId, normalizedResult)
+    session.turnToolItems.delete(normalizedResult.turnId)
+    this.resolvePendingApprovalsForTurn(
+      session,
+      normalizedResult.turnId,
+      'decline'
+    )
+    const promptStream = session.turnPromptStreams.get(normalizedResult.turnId)
     if (promptStream) {
       promptStream.close()
-      session.turnPromptStreams.delete(result.turnId)
+      session.turnPromptStreams.delete(normalizedResult.turnId)
     }
-    session.turnPromptTexts.delete(result.turnId)
-    if (session.activeTurnId === result.turnId) {
+    session.turnPromptTexts.delete(normalizedResult.turnId)
+    if (session.activeTurnId === normalizedResult.turnId) {
       session.activeTurnId = null
     }
 
-    const waiters = session.turnWaiters.get(result.turnId) ?? []
+    const waiters = session.turnWaiters.get(normalizedResult.turnId) ?? []
     for (const waiter of waiters) {
-      waiter(result)
+      waiter(normalizedResult)
     }
-    session.turnWaiters.delete(result.turnId)
+    session.turnWaiters.delete(normalizedResult.turnId)
 
     this.emit({
       event: 'turn.completed',
       sessionId: session.sessionId,
-      turnId: result.turnId,
+      turnId: normalizedResult.turnId,
       payload: {
-        turnId: result.turnId,
-        status: result.status,
-        usage: result.usage,
+        turnId: normalizedResult.turnId,
+        status: normalizedResult.status,
+        usage: normalizedResult.usage,
+        assistant_text: assistantText ?? null,
       },
     })
   }

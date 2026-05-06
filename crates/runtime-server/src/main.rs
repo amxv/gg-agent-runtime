@@ -1,16 +1,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use runtime_server::{
-    bootstrap_runtime, build_router, AppState, AuthBootstrapSource, RuntimeServerConfig,
+    bootstrap_runtime, build_router, write_openapi_artifact, AppState, AuthBootstrapSource,
+    RuntimeServerConfig,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let config_path = parse_config_path();
+    let cli = parse_cli()?;
+    if let CliCommand::WriteOpenApi { path } = cli {
+        write_openapi_artifact(path.as_path())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        tracing::info!(path = %path.display(), "wrote generated OpenAPI artifact");
+        return Ok(());
+    }
+
+    let CliCommand::Serve { config_path } = cli else {
+        return Err(anyhow!("unsupported CLI command"));
+    };
     let config = RuntimeServerConfig::load(config_path.as_deref())?;
     let bootstrapped = bootstrap_runtime(config).await?;
 
@@ -57,14 +68,38 @@ fn init_tracing() {
         .init();
 }
 
-fn parse_config_path() -> Option<PathBuf> {
+enum CliCommand {
+    Serve { config_path: Option<PathBuf> },
+    WriteOpenApi { path: PathBuf },
+}
+
+fn parse_cli() -> Result<CliCommand> {
     let mut args = std::env::args().skip(1);
+    let mut config_path = None;
+    let mut write_openapi_path = None;
     while let Some(arg) = args.next() {
-        if arg == "--config" {
-            return args.next().map(PathBuf::from);
+        match arg.as_str() {
+            "--config" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--config requires a path argument"))?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "--write-openapi" => {
+                let path = args.next().map(PathBuf::from).unwrap_or_else(|| {
+                    PathBuf::from("openapi").join("runtime-server-openapi.yaml")
+                });
+                write_openapi_path = Some(path);
+            }
+            other => {
+                return Err(anyhow!("unknown argument: {other}"));
+            }
         }
     }
-    None
+    if let Some(path) = write_openapi_path {
+        return Ok(CliCommand::WriteOpenApi { path });
+    }
+    Ok(CliCommand::Serve { config_path })
 }
 
 fn describe_auth_source(source: &AuthBootstrapSource) -> String {

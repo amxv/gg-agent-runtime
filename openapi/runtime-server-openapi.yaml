@@ -1,0 +1,1017 @@
+openapi: 3.1.0
+info:
+  title: GG Standalone Agent Runtime API
+  version: 0.1.0
+  summary: Single-user hosted runtime for Codex/Claude sessions, teams, processes, worktrees, and SSE streams
+servers:
+  - url: http://localhost:8080
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API token
+  schemas:
+    JsonObject:
+      type: object
+      additionalProperties: true
+paths:
+  /health:
+    get:
+      summary: Public health check
+      security: []
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /openapi.yaml:
+    get:
+      summary: Generated OpenAPI schema
+      security: []
+      responses:
+        "200":
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /v1/diagnostics:
+    get:
+      summary: Runtime diagnostics summary
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/comms:
+    get:
+      summary: Team comms diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/processes:
+    get:
+      summary: Process diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/providers:
+    get:
+      summary: Provider diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/recovery:
+    get:
+      summary: Startup recovery diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/team-operations:
+    get:
+      summary: Team operations diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/diagnostics/worktrees:
+    get:
+      summary: Worktree diagnostics
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/events:
+    get:
+      summary: Replay runtime events
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/events/stream:
+    get:
+      summary: Stream runtime events (SSE)
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/health:
+    get:
+      summary: Authenticated health check
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/mcp/capabilities:
+    get:
+      summary: Runtime MCP capabilities
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/mcp/invoke:
+    post:
+      summary: Invoke runtime MCP tool
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/openapi.yaml:
+    get:
+      summary: Generated OpenAPI schema (authenticated)
+      responses:
+        "200":
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /v1/processes:
+    get:
+      summary: List processes
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    post:
+      summary: Start process
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/processes/{process_id}:
+    get:
+      summary: Get process
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/processes/{process_id}/events:
+    get:
+      summary: Replay process events
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/processes/{process_id}/events/stream:
+    get:
+      summary: Stream process events (SSE)
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/processes/{process_id}/kill:
+    post:
+      summary: Kill process
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/processes/{process_id}/logs:
+    get:
+      summary: Read process logs
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers:
+    get:
+      summary: List providers
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/claude/auth/api-key:
+    post:
+      summary: Set Claude API key
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/claude/auth/import-file:
+    post:
+      summary: Import Claude auth file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/claude/auth/import-json:
+    post:
+      summary: Import Claude auth JSON
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/claude/auth/logout:
+    post:
+      summary: Clear runtime-managed Claude auth
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/claude/auth/status:
+    get:
+      summary: Claude auth status
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/codex/auth/status:
+    get:
+      summary: Codex auth status
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/providers/{provider}/models:
+    get:
+      summary: List models for provider
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions:
+    get:
+      summary: List sessions
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    post:
+      summary: Create session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}:
+    get:
+      summary: Get session
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/approvals/{approval_id}:
+    post:
+      summary: Respond to approval
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: approval_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/close:
+    post:
+      summary: Close session
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/events:
+    get:
+      summary: Replay session events
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/events/stream:
+    get:
+      summary: Stream session events (SSE)
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/sessions/{session_id}/resume:
+    post:
+      summary: Resume session
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/turns:
+    post:
+      summary: Send session turn
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/sessions/{session_id}/turns/{turn_id}/interrupt:
+    post:
+      summary: Interrupt turn
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: turn_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams:
+    get:
+      summary: List teams
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    post:
+      summary: Create team
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}:
+    get:
+      summary: Get team
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    delete:
+      summary: Delete team
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+  /v1/teams/{team_id}/broadcasts:
+    post:
+      summary: Send team broadcast
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/deliveries:
+    get:
+      summary: List team deliveries
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/deliveries/{delivery_id}/retry:
+    post:
+      summary: Retry team delivery
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: delivery_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/events:
+    get:
+      summary: Replay team events
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/events/stream:
+    get:
+      summary: Stream team events (SSE)
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /v1/teams/{team_id}/interrupt-all:
+    post:
+      summary: Interrupt all active team turns
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/lead:
+    post:
+      summary: Set team lead
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/members:
+    post:
+      summary: Join team member
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/members/spawn:
+    post:
+      summary: Spawn team member
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/members/{agent_id}:
+    delete:
+      summary: Remove team member
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+  /v1/teams/{team_id}/messages:
+    get:
+      summary: List team messages
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    post:
+      summary: Send direct team message
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/messages/{message_id}/cancel:
+    post:
+      summary: Cancel team message
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: message_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/teams/{team_id}/view:
+    get:
+      summary: Team view snapshot
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/version:
+    get:
+      summary: Runtime version
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/worktrees:
+    get:
+      summary: List worktrees
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+    post:
+      summary: Create worktree
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/worktrees/{worktree_id}:
+    get:
+      summary: Get worktree
+      parameters:
+        - name: worktree_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/worktrees/{worktree_id}/claims:
+    post:
+      summary: Claim worktree
+      parameters:
+        - name: worktree_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/worktrees/{worktree_id}/cleanup:
+    post:
+      summary: Cleanup worktree
+      parameters:
+        - name: worktree_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"
+  /v1/worktrees/{worktree_id}/release:
+    post:
+      summary: Release worktree claim
+      parameters:
+        - name: worktree_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JsonObject"
+      responses:
+        "200":
+          description: JSON response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JsonObject"

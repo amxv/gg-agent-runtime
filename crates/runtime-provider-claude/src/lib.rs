@@ -34,6 +34,30 @@ const CLAUDE_STDOUT_WORKER_LANE_COUNT: usize = 16;
 const CLAUDE_STDOUT_WORKER_QUEUE_CAPACITY: usize = 128;
 const GG_MCP_MISSING_BAD_REQUEST: &str = "Missing ggMcpServer config for SDK mode session";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeAuthMode {
+    HostMachine,
+    RuntimeManaged,
+}
+
+impl ClaudeAuthMode {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("runtime_managed") | Some("runtime-managed") | Some("runtime") => {
+                Self::RuntimeManaged
+            }
+            _ => Self::HostMachine,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HostMachine => "host_machine",
+            Self::RuntimeManaged => "runtime_managed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeGgMcpConfig {
     pub enabled: bool,
@@ -328,7 +352,19 @@ impl ClaudeProvider {
             .filter(|path| !path.as_os_str().is_empty())
     }
 
-    fn bridge_home_dir(&self) -> Option<PathBuf> {
+    fn auth_mode(&self) -> ClaudeAuthMode {
+        let env_mode = std::env::var("GG_CLAUDE_AUTH_MODE").ok();
+        let configured = self
+            .inner
+            .config
+            .bridge_env
+            .get("GG_CLAUDE_AUTH_MODE")
+            .map(String::as_str)
+            .or(env_mode.as_deref());
+        ClaudeAuthMode::parse(configured)
+    }
+
+    fn bridge_home_dir(&self) -> PathBuf {
         if let Some(home_override) = self
             .inner
             .config
@@ -338,9 +374,15 @@ impl ClaudeProvider {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
         {
-            return Some(home_override);
+            return home_override;
         }
-        Self::process_home_dir()
+
+        match self.auth_mode() {
+            ClaudeAuthMode::HostMachine => {
+                Self::process_home_dir().unwrap_or_else(|| self.runtime_home_dir())
+            }
+            ClaudeAuthMode::RuntimeManaged => self.runtime_home_dir(),
+        }
     }
 
     fn bridge_claude_config_dir_override(&self) -> Option<PathBuf> {
@@ -356,29 +398,43 @@ impl ClaudeProvider {
             return Some(config_override);
         }
 
-        std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty())
+        match self.auth_mode() {
+            ClaudeAuthMode::HostMachine => std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty()),
+            ClaudeAuthMode::RuntimeManaged => Some(self.inner.config.config_dir.clone()),
+        }
+    }
+
+    fn bridge_auth_overrides_active(&self) -> bool {
+        self.inner
+            .config
+            .bridge_env
+            .get("HOME")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+            || self
+                .inner
+                .config
+                .bridge_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
     }
 
     fn resolve_bridge_auth_environment(&self) -> Result<ClaudeBridgeAuthEnvironment, RuntimeError> {
-        let home_dir = self.bridge_home_dir().ok_or_else(|| {
-            RuntimeError::InvalidState(
-                "HOME is not set; cannot resolve Claude canonical auth paths".to_string(),
-            )
-        })?;
-        let claude_config_dir_override = self.bridge_claude_config_dir_override();
+        let home_dir = self.bridge_home_dir();
+        let claude_config_dir = self.bridge_claude_config_dir_override();
         let auth_paths =
-            resolve_claude_auth_paths(claude_config_dir_override.clone(), Some(home_dir.clone()))
+            resolve_claude_auth_paths(claude_config_dir.clone(), Some(home_dir.clone()))
                 .ok_or_else(|| {
-                RuntimeError::InvalidState(
-                    "unable to resolve Claude auth/config paths from HOME".to_string(),
-                )
-            })?;
-        let claude_config_dir = auth_paths.config_dir.clone();
+                    RuntimeError::InvalidState(
+                        "unable to resolve Claude auth/config paths".to_string(),
+                    )
+                })?;
         Ok(ClaudeBridgeAuthEnvironment {
             home_dir,
-            claude_config_dir,
+            claude_config_dir: auth_paths.config_dir.clone(),
             auth_paths,
         })
     }
@@ -622,10 +678,12 @@ impl ClaudeProvider {
 
     async fn provider_auth_status_internal(&self) -> Result<ProviderAuthStatus, RuntimeError> {
         self.ensure_provider_enabled().await?;
+        let auth_mode = self.auth_mode();
         let runtime_auth_paths = self.runtime_claude_auth_paths();
         let runtime_credentials_present =
             has_claude_oauth_access_token(runtime_auth_paths.credentials_path.as_path());
         let runtime_config_json_present = runtime_auth_paths.config_path.exists();
+        let runtime_oauth_ready = runtime_credentials_present && runtime_config_json_present;
         let bridge_auth_env = self.resolve_bridge_auth_environment().ok();
         let bridge_credentials_present = bridge_auth_env
             .as_ref()
@@ -635,10 +693,27 @@ impl ClaudeProvider {
             .as_ref()
             .map(|env| env.auth_paths.config_path.exists())
             .unwrap_or(false);
+        let bridge_oauth_ready = bridge_credentials_present && bridge_config_json_present;
         let api_key_present = self.read_api_key().await?.is_some();
+        let authenticated = match auth_mode {
+            ClaudeAuthMode::HostMachine => {
+                runtime_oauth_ready || bridge_oauth_ready || api_key_present
+            }
+            ClaudeAuthMode::RuntimeManaged => {
+                runtime_oauth_ready
+                    || (self.bridge_auth_overrides_active() && bridge_oauth_ready)
+                    || api_key_present
+            }
+        };
+        let oauth_mode_ready = match auth_mode {
+            ClaudeAuthMode::HostMachine => runtime_oauth_ready || bridge_oauth_ready,
+            ClaudeAuthMode::RuntimeManaged => {
+                runtime_oauth_ready || (self.bridge_auth_overrides_active() && bridge_oauth_ready)
+            }
+        };
         Ok(ProviderAuthStatus {
-            authenticated: runtime_credentials_present || bridge_credentials_present || api_key_present,
-            mode: if runtime_credentials_present || bridge_credentials_present {
+            authenticated,
+            mode: if oauth_mode_ready {
                 Some("claude_code_oauth".to_string())
             } else if api_key_present {
                 Some("api_key".to_string())
@@ -646,12 +721,14 @@ impl ClaudeProvider {
                 None
             },
             detail: Some(format!(
-                "runtime_credentials_path={} runtime_config_path={} runtime_config_source={} runtime_credentials_present={} runtime_config_present={} bridge_credentials_path={} bridge_config_path={} bridge_config_source={} bridge_credentials_present={} bridge_config_present={} api_key_present={}",
+                "auth_mode={} runtime_credentials_path={} runtime_config_path={} runtime_config_source={} runtime_credentials_present={} runtime_config_present={} runtime_oauth_ready={} bridge_credentials_path={} bridge_config_path={} bridge_config_source={} bridge_credentials_present={} bridge_config_present={} bridge_oauth_ready={} bridge_override_active={} api_key_present={}",
+                auth_mode.as_str(),
                 runtime_auth_paths.credentials_path.display(),
                 runtime_auth_paths.config_path.display(),
                 runtime_auth_paths.config_source.as_str(),
                 runtime_credentials_present,
                 runtime_config_json_present,
+                runtime_oauth_ready,
                 bridge_auth_env
                     .as_ref()
                     .map(|env| env.auth_paths.credentials_path.display().to_string())
@@ -666,6 +743,8 @@ impl ClaudeProvider {
                     .unwrap_or("unknown"),
                 bridge_credentials_present,
                 bridge_config_json_present,
+                bridge_oauth_ready,
+                self.bridge_auth_overrides_active(),
                 api_key_present,
             )),
         })
@@ -1600,12 +1679,14 @@ impl RuntimeProvider for ClaudeProvider {
             resolved_turn_id
         };
         let status = extract_turn_status(result.get("status"));
+        let assistant_text = extract_assistant_text(result.get("assistant_text"))
+            .or_else(|| extract_assistant_text(result.get("assistantText")));
 
         let turn_result = ProviderTurnResult {
             runtime_session_id: req.runtime_session_id,
             turn_id: turn_id.clone(),
             status,
-            usage: result.get("usage").cloned(),
+            usage: merge_assistant_text_into_usage(result.get("usage").cloned(), assistant_text),
             error: result.get("error").cloned(),
         };
 
@@ -1672,6 +1753,46 @@ fn extract_turn_status(value: Option<&Value>) -> ProviderTurnStatus {
         Some("interrupted") => ProviderTurnStatus::Interrupted,
         Some("failed") => ProviderTurnStatus::Failed,
         _ => ProviderTurnStatus::InProgress,
+    }
+}
+
+fn extract_assistant_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn merge_assistant_text_into_usage(
+    usage: Option<Value>,
+    assistant_text: Option<String>,
+) -> Option<Value> {
+    let Some(assistant_text) = assistant_text else {
+        return usage;
+    };
+    if assistant_text.trim().is_empty() {
+        return usage;
+    }
+
+    match usage {
+        Some(Value::Object(mut usage_object)) => {
+            usage_object.insert(
+                "last_message".to_string(),
+                Value::String(assistant_text.clone()),
+            );
+            usage_object.insert("assistant_text".to_string(), Value::String(assistant_text));
+            Some(Value::Object(usage_object))
+        }
+        Some(existing) => Some(serde_json::json!({
+            "last_message": assistant_text.clone(),
+            "assistant_text": assistant_text,
+            "raw_usage": existing,
+        })),
+        None => Some(serde_json::json!({
+            "last_message": assistant_text.clone(),
+            "assistant_text": assistant_text,
+        })),
     }
 }
 
@@ -2403,11 +2524,16 @@ async fn handle_bridge_event(
         "turn.completed" => {
             if let Some(turn_id) = event_turn_id {
                 let status = extract_turn_status(payload_body.get("status"));
+                let assistant_text = extract_assistant_text(payload_body.get("assistant_text"))
+                    .or_else(|| extract_assistant_text(payload_body.get("assistantText")));
                 let turn_result = ProviderTurnResult {
                     runtime_session_id: session.runtime_session_id.clone(),
                     turn_id: turn_id.clone(),
                     status,
-                    usage: payload_body.get("usage").cloned(),
+                    usage: merge_assistant_text_into_usage(
+                        payload_body.get("usage").cloned(),
+                        assistant_text,
+                    ),
                     error: payload_body.get("error").cloned(),
                 };
                 {
@@ -3024,7 +3150,126 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn bridge_spawn_defaults_to_canonical_home_and_config_resolution() {
+    async fn auth_status_uses_host_machine_bridge_oauth_by_default() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let canonical_home = temp_dir.path().join("canonical-home");
+        let canonical_config = temp_dir.path().join("canonical-config");
+        let canonical_credentials = canonical_home.join(".claude").join(".credentials.json");
+        std::fs::create_dir_all(
+            canonical_credentials
+                .parent()
+                .expect("canonical credentials parent"),
+        )
+        .expect("create canonical credentials dir");
+        std::fs::create_dir_all(canonical_config.as_path()).expect("create canonical config dir");
+        std::fs::write(
+            canonical_credentials.as_path(),
+            r#"{"claudeAiOauth":{"accessToken":"bridge-only","refreshToken":"bridge-only"}}"#,
+        )
+        .expect("write canonical credentials");
+        std::fs::write(canonical_config.join(".claude.json"), r#"{"projects":{}}"#)
+            .expect("write canonical config");
+
+        let mut bridge_env = BTreeMap::new();
+        bridge_env.insert("HOME".to_string(), canonical_home.display().to_string());
+        bridge_env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            canonical_config.display().to_string(),
+        );
+
+        let provider = ClaudeProvider::new(ClaudeProviderConfig {
+            enabled: true,
+            config_dir: temp_dir.path().join("runtime-claude-config"),
+            bridge_command: "does-not-matter".to_string(),
+            bridge_args: Vec::new(),
+            max_bridges: 1,
+            max_sessions_per_bridge: 1,
+            request_timeout_ms: 100,
+            default_wait_timeout_ms: 100,
+            heartbeat_interval_ms: 10_000,
+            heartbeat_failure_threshold: 3,
+            gg_mcp: ClaudeGgMcpConfig::default(),
+            bridge_env,
+        });
+
+        let status = provider.auth_status().await.expect("auth status");
+        assert!(status.authenticated, "host-mode auth status should be true");
+        assert_eq!(status.mode.as_deref(), Some("claude_code_oauth"));
+        let detail = status.detail.unwrap_or_default();
+        assert!(
+            detail.contains("bridge_credentials_present=true"),
+            "expected detail to surface bridge credential visibility"
+        );
+        assert!(
+            detail.contains("auth_mode=host_machine"),
+            "expected host-mode detail annotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_managed_mode_allows_explicit_host_bridge_overrides() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let canonical_home = temp_dir.path().join("canonical-home");
+        let canonical_config = temp_dir.path().join("canonical-config");
+        let canonical_credentials = canonical_home.join(".claude").join(".credentials.json");
+        std::fs::create_dir_all(
+            canonical_credentials
+                .parent()
+                .expect("canonical credentials parent"),
+        )
+        .expect("create canonical credentials dir");
+        std::fs::create_dir_all(canonical_config.as_path()).expect("create canonical config dir");
+        std::fs::write(
+            canonical_credentials.as_path(),
+            r#"{"claudeAiOauth":{"accessToken":"bridge-only","refreshToken":"bridge-only"}}"#,
+        )
+        .expect("write canonical credentials");
+        std::fs::write(canonical_config.join(".claude.json"), r#"{"projects":{}}"#)
+            .expect("write canonical config");
+
+        let mut bridge_env = BTreeMap::new();
+        bridge_env.insert("HOME".to_string(), canonical_home.display().to_string());
+        bridge_env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            canonical_config.display().to_string(),
+        );
+        bridge_env.insert(
+            "GG_CLAUDE_AUTH_MODE".to_string(),
+            "runtime_managed".to_string(),
+        );
+
+        let provider = ClaudeProvider::new(ClaudeProviderConfig {
+            enabled: true,
+            config_dir: temp_dir.path().join("runtime-claude-config"),
+            bridge_command: "does-not-matter".to_string(),
+            bridge_args: Vec::new(),
+            max_bridges: 1,
+            max_sessions_per_bridge: 1,
+            request_timeout_ms: 100,
+            default_wait_timeout_ms: 100,
+            heartbeat_interval_ms: 10_000,
+            heartbeat_failure_threshold: 3,
+            gg_mcp: ClaudeGgMcpConfig::default(),
+            bridge_env,
+        });
+        let status = provider.auth_status().await.expect("auth status");
+        assert!(
+            status.authenticated,
+            "runtime-managed mode should accept explicit bridge HOME/CLAUDE_CONFIG_DIR overrides"
+        );
+        let detail = status.detail.unwrap_or_default();
+        assert!(
+            detail.contains("auth_mode=runtime_managed"),
+            "expected runtime-managed mode detail annotation"
+        );
+        assert!(
+            detail.contains("bridge_override_active=true"),
+            "expected explicit override detail annotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_spawn_defaults_to_host_machine_home_and_config_resolution() {
         let harness = FakeClaudeBridgeHarness::new("normal");
         let provider = harness.provider(ClaudeGgMcpConfig::default());
 
@@ -3206,11 +3451,11 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn bridge_spawn_fails_fast_when_canonical_credentials_missing() {
+    async fn bridge_spawn_fails_fast_when_runtime_credentials_missing() {
         let harness = FakeClaudeBridgeHarness::new("normal");
         let credentials_path = harness.home_dir.join(".claude").join(".credentials.json");
         std::fs::remove_file(credentials_path.as_path())
-            .expect("remove canonical credentials fixture");
+            .expect("remove runtime credentials fixture");
         let provider = harness.provider(ClaudeGgMcpConfig::default());
 
         let result = provider
@@ -3227,7 +3472,7 @@ for raw_line in sys.stdin:
         let rendered = format!("{error}");
         assert!(
             rendered.contains("Claude OAuth credentials file missing"),
-            "expected missing-credentials fail-fast message, got: {rendered}"
+            "expected missing-runtime-credentials fail-fast message, got: {rendered}"
         );
         assert!(
             rendered.contains("/v1/providers/claude/auth/import-json"),
@@ -3240,7 +3485,7 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn bridge_spawn_fails_fast_when_canonical_config_is_malformed() {
+    async fn bridge_spawn_fails_fast_when_runtime_config_is_malformed() {
         let harness = FakeClaudeBridgeHarness::new("normal");
         let config_path = harness.config_dir.join(".claude.json");
         std::fs::write(config_path.as_path(), "{not-valid-json")
@@ -3261,17 +3506,17 @@ for raw_line in sys.stdin:
         let rendered = format!("{error}");
         assert!(
             rendered.contains("is not valid JSON"),
-            "expected malformed-config fail-fast message, got: {rendered}"
+            "expected malformed-runtime-config fail-fast message, got: {rendered}"
         );
     }
 
     #[tokio::test]
-    async fn bridge_spawn_api_key_bypasses_oauth_preflight() {
+    async fn bridge_spawn_explicit_api_key_override_bypasses_oauth_preflight() {
         let harness = FakeClaudeBridgeHarness::new("normal");
         let credentials_path = harness.home_dir.join(".claude").join(".credentials.json");
         let config_path = harness.config_dir.join(".claude.json");
         std::fs::remove_file(credentials_path.as_path())
-            .expect("remove canonical credentials fixture");
+            .expect("remove runtime credentials fixture");
         std::fs::write(config_path.as_path(), "{not-valid-json")
             .expect("write malformed config fixture");
 
@@ -3563,6 +3808,28 @@ for raw_line in sys.stdin:
             "message": "invalid field",
         }));
         assert!(matches!(bad_request, RuntimeError::InvalidState(_)));
+    }
+
+    #[test]
+    fn merge_assistant_text_into_usage_sets_last_message() {
+        let merged = merge_assistant_text_into_usage(
+            Some(serde_json::json!({
+                "inputTokens": 10,
+                "outputTokens": 20
+            })),
+            Some("hello from claude".to_string()),
+        )
+        .expect("merged usage");
+        assert_eq!(merged["last_message"], "hello from claude");
+        assert_eq!(merged["assistant_text"], "hello from claude");
+    }
+
+    #[test]
+    fn merge_assistant_text_into_usage_creates_usage_when_missing() {
+        let merged = merge_assistant_text_into_usage(None, Some("terminal text only".to_string()))
+            .expect("merged usage");
+        assert_eq!(merged["last_message"], "terminal text only");
+        assert_eq!(merged["assistant_text"], "terminal text only");
     }
 
     #[tokio::test]

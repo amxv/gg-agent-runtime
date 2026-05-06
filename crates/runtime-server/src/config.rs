@@ -14,6 +14,8 @@ pub struct RuntimeServerConfig {
     pub events: EventsConfig,
     pub processes: ProcessesConfig,
     pub worktrees: WorktreesConfig,
+    #[serde(skip)]
+    config_file_dir: Option<PathBuf>,
 }
 
 impl Default for RuntimeServerConfig {
@@ -26,6 +28,7 @@ impl Default for RuntimeServerConfig {
             events: EventsConfig::default(),
             processes: ProcessesConfig::default(),
             worktrees: WorktreesConfig::default(),
+            config_file_dir: None,
         }
     }
 }
@@ -37,9 +40,10 @@ impl RuntimeServerConfig {
                 let content = std::fs::read_to_string(config_path).with_context(|| {
                     format!("failed to read config file {}", config_path.display())
                 })?;
-                let config = toml::from_str::<Self>(&content).with_context(|| {
+                let mut config = toml::from_str::<Self>(&content).with_context(|| {
                     format!("failed to parse config file {}", config_path.display())
                 })?;
+                config.config_file_dir = resolve_config_file_dir(config_path);
                 Ok(config)
             }
             None => Ok(Self::default()),
@@ -47,8 +51,9 @@ impl RuntimeServerConfig {
     }
 
     pub fn ensure_data_dirs(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.data.root_dir)
-            .with_context(|| format!("failed to create {}", self.data.root_dir.display()))?;
+        let root_dir = self.resolve_root_dir();
+        std::fs::create_dir_all(&root_dir)
+            .with_context(|| format!("failed to create {}", root_dir.display()))?;
         std::fs::create_dir_all(self.resolve_data_path(&self.data.logs_dir))
             .with_context(|| "failed to create logs directory".to_string())?;
         std::fs::create_dir_all(self.resolve_data_path(&self.data.providers_dir))
@@ -58,11 +63,24 @@ impl RuntimeServerConfig {
         Ok(())
     }
 
+    pub fn resolve_root_dir(&self) -> PathBuf {
+        if self.data.root_dir.is_absolute() {
+            return self.data.root_dir.clone();
+        }
+        if let Some(config_dir) = self.config_file_dir.as_ref() {
+            return config_dir.join(&self.data.root_dir);
+        }
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(&self.data.root_dir),
+            Err(_) => self.data.root_dir.clone(),
+        }
+    }
+
     pub fn resolve_data_path(&self, raw: &Path) -> PathBuf {
         if raw.is_absolute() {
             return raw.to_path_buf();
         }
-        self.data.root_dir.join(raw)
+        self.resolve_root_dir().join(raw)
     }
 
     pub fn resolve_sqlite_path(&self) -> PathBuf {
@@ -73,7 +91,7 @@ impl RuntimeServerConfig {
         if self.worktrees.root_dir.is_absolute() {
             return self.worktrees.root_dir.clone();
         }
-        self.data.root_dir.join(&self.worktrees.root_dir)
+        self.resolve_root_dir().join(&self.worktrees.root_dir)
     }
 
     pub fn resolve_provider_dir(&self, provider_name: &str) -> PathBuf {
@@ -126,8 +144,8 @@ impl RuntimeServerConfig {
     fn resolve_auth_token_file_path(&self) -> PathBuf {
         match self.auth.token_file.as_ref() {
             Some(path) if path.is_absolute() => path.clone(),
-            Some(path) => self.data.root_dir.join(path),
-            None => self.data.root_dir.join("auth").join("api-token"),
+            Some(path) => self.resolve_root_dir().join(path),
+            None => self.resolve_root_dir().join("auth").join("api-token"),
         }
     }
 }
@@ -199,6 +217,7 @@ impl Default for DataConfig {
 pub struct ProvidersConfig {
     pub codex: ProviderConfig,
     pub claude: ProviderConfig,
+    pub claude_auth_mode: String,
 }
 
 impl Default for ProvidersConfig {
@@ -214,6 +233,7 @@ impl Default for ProvidersConfig {
                 max_instances: 4,
                 max_sessions_per_instance: 4,
             },
+            claude_auth_mode: "host_machine".to_string(),
         }
     }
 }
@@ -316,6 +336,15 @@ fn default_runtime_root_dir() -> PathBuf {
     PathBuf::from(".gg-runtime")
 }
 
+fn resolve_config_file_dir(config_path: &Path) -> Option<PathBuf> {
+    let absolute_path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(config_path)
+    };
+    absolute_path.parent().map(Path::to_path_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +356,7 @@ mod tests {
         assert_eq!(config.events.live_queue_capacity, 4096);
         assert!(config.providers.codex.enabled);
         assert!(config.providers.claude.enabled);
+        assert_eq!(config.providers.claude_auth_mode, "host_machine");
         assert_eq!(config.processes.max_concurrent, 32);
         assert!(config.worktrees.enabled);
     }
@@ -360,5 +390,45 @@ mod tests {
             _ => panic!("expected existing token file source"),
         }
         assert_eq!(first.bearer_token, second.bearer_token);
+    }
+
+    #[test]
+    fn resolve_data_paths_are_absolute_when_root_is_relative() {
+        let mut config = RuntimeServerConfig::default();
+        config.data.root_dir = PathBuf::from("tmp/runtime-relative-root");
+
+        let resolved_root = config.resolve_root_dir();
+        let resolved_provider_dir = config.resolve_provider_dir("codex");
+        let resolved_sqlite = config.resolve_sqlite_path();
+
+        assert!(resolved_root.is_absolute());
+        assert!(resolved_provider_dir.is_absolute());
+        assert!(resolved_sqlite.is_absolute());
+        assert!(resolved_provider_dir.starts_with(&resolved_root));
+        assert!(resolved_sqlite.starts_with(&resolved_root));
+    }
+
+    #[test]
+    fn resolve_relative_paths_from_config_file_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("runtime-server.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[data]
+root_dir = ".gg-runtime"
+"#,
+        )
+        .expect("write config");
+
+        let config = RuntimeServerConfig::load(Some(config_path.as_path())).expect("load config");
+        assert_eq!(
+            config.resolve_root_dir(),
+            temp_dir.path().join(".gg-runtime")
+        );
+        assert_eq!(
+            config.resolve_worktree_root(),
+            temp_dir.path().join(".gg-runtime").join("worktrees")
+        );
     }
 }

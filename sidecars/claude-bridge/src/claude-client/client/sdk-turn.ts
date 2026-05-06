@@ -259,6 +259,7 @@ export async function runTurnWithSdk(
   let emittedToolUseSummaryFallback = false
   const assistantReasoningFallback = new Map<number, string[]>()
   const toolUseSummaryFallback: string[] = []
+  const assistantTextFragments: string[] = []
   let latestAssistantUsage: ClaudeTurnUsage | undefined
   session.turnToolItems.set(turnId, new Map<string, SdkToolItemState>())
 
@@ -397,6 +398,7 @@ export async function runTurnWithSdk(
         }
 
         const assistantText = extractAssistantDeltas(message)
+        assistantTextFragments.push(...assistantText)
         if (!emittedMessageDelta) {
           for (const delta of assistantText) {
             deps.emit({
@@ -544,6 +546,7 @@ export async function runTurnWithSdk(
 
         const streamDelta = extractStreamDelta(message)
         if (streamDelta) {
+          assistantTextFragments.push(streamDelta)
           deps.emit({
             event: 'message.delta',
             sessionId: session.sessionId,
@@ -632,6 +635,10 @@ export async function runTurnWithSdk(
             resultUsage,
             contextWindowSize,
           }),
+          assistantText:
+            resultText?.trim() ||
+            assistantTextFragments.join('').trim() ||
+            undefined,
         })
         return
       }
@@ -658,6 +665,7 @@ export async function runTurnWithSdk(
         usage: deps.resolveSdkTurnUsage(session, {
           assistantUsage: latestAssistantUsage,
         }),
+        assistantText: assistantTextFragments.join('').trim() || undefined,
       })
     } else {
       emitAssistantReasoningFallbackIfNeeded()
@@ -679,6 +687,7 @@ export async function runTurnWithSdk(
         usage: deps.resolveSdkTurnUsage(session, {
           assistantUsage: latestAssistantUsage,
         }),
+        assistantText: assistantTextFragments.join('').trim() || undefined,
       })
     }
   } catch (error) {
@@ -703,6 +712,7 @@ export async function runTurnWithSdk(
         usage: deps.resolveSdkTurnUsage(session, {
           assistantUsage: latestAssistantUsage,
         }),
+        assistantText: assistantTextFragments.join('').trim() || undefined,
       })
       return
     }
@@ -737,6 +747,7 @@ export async function runTurnWithSdk(
       usage: deps.resolveSdkTurnUsage(session, {
         assistantUsage: latestAssistantUsage,
       }),
+      assistantText: assistantTextFragments.join('').trim() || undefined,
     })
   } finally {
     session.activeSdkQuery = null

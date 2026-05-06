@@ -78,6 +78,12 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     {
         claude_bridge_env.insert("HOME".to_string(), override_home);
     }
+    let claude_auth_mode = std::env::var("GG_CLAUDE_AUTH_MODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| config.providers.claude_auth_mode.clone());
+    claude_bridge_env.insert("GG_CLAUDE_AUTH_MODE".to_string(), claude_auth_mode);
     let mcp_gateway_url = format!(
         "{}/v1/mcp",
         config.server.public_base_url.trim_end_matches('/')

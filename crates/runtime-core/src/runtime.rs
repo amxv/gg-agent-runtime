@@ -1194,6 +1194,10 @@ impl RuntimeSessionManager {
             ProviderTurnStatus::Failed => "turn.failed",
             ProviderTurnStatus::InProgress => "turn.in_progress",
         };
+        let assistant_text = result
+            .usage
+            .as_ref()
+            .and_then(extract_assistant_text_from_usage);
         drop(sessions);
         drop(turns);
 
@@ -1209,6 +1213,7 @@ impl RuntimeSessionManager {
                     "status": result.status.as_str(),
                     "usage": result.usage,
                     "error": result.error,
+                    "assistant_text": assistant_text,
                 }),
             )
             .await?;
@@ -1366,6 +1371,9 @@ fn extract_turn_user_text(input: Option<&Vec<Value>>) -> Option<String> {
 fn extract_assistant_text_from_usage(usage: &Value) -> Option<String> {
     usage
         .get("last_message")
+        .or_else(|| usage.get("lastMessage"))
+        .or_else(|| usage.get("assistant_text"))
+        .or_else(|| usage.get("assistantText"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1380,8 +1388,13 @@ fn append_session_transcript(metadata: &mut Value, role: &str, text: &str) {
         Value::Object(object) => object,
         _ => return,
     };
+    if !metadata_object.contains_key("session_transcript") {
+        if let Some(existing) = metadata_object.remove("codex_transcript") {
+            metadata_object.insert("session_transcript".to_string(), existing);
+        }
+    }
     let entry = metadata_object
-        .entry("codex_transcript")
+        .entry("session_transcript")
         .or_insert_with(|| Value::Array(Vec::new()));
     if !entry.is_array() {
         *entry = Value::Array(Vec::new());
@@ -1759,6 +1772,39 @@ mod tests {
             RuntimeSessionManager::new(store, Arc::new(registry), 256)
                 .expect("build runtime manager"),
         )
+    }
+
+    #[test]
+    fn assistant_text_extraction_supports_snake_and_camel_fields() {
+        let usage_snake = serde_json::json!({ "last_message": "snake" });
+        let usage_camel = serde_json::json!({ "lastMessage": "camel" });
+        let usage_assistant_text = serde_json::json!({ "assistant_text": "provider-neutral" });
+        assert_eq!(
+            extract_assistant_text_from_usage(&usage_snake).as_deref(),
+            Some("snake")
+        );
+        assert_eq!(
+            extract_assistant_text_from_usage(&usage_camel).as_deref(),
+            Some("camel")
+        );
+        assert_eq!(
+            extract_assistant_text_from_usage(&usage_assistant_text).as_deref(),
+            Some("provider-neutral")
+        );
+    }
+
+    #[test]
+    fn append_session_transcript_migrates_legacy_key() {
+        let mut metadata = serde_json::json!({
+            "codex_transcript": [{"role":"assistant","text":"old"}]
+        });
+        append_session_transcript(&mut metadata, "assistant", "new");
+        let rows = metadata
+            .get("session_transcript")
+            .and_then(Value::as_array)
+            .expect("session transcript rows");
+        assert_eq!(rows.len(), 2);
+        assert!(metadata.get("codex_transcript").is_none());
     }
 
     #[tokio::test]

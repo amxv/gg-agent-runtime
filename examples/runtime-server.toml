@@ -1,0 +1,48 @@
+[server]
+bind_address = "0.0.0.0:8080"
+public_base_url = "http://127.0.0.1:8080"
+
+[auth]
+mode = "static_bearer"
+# Optional static token; if omitted, server creates one under data root.
+# token = "replace-with-strong-token"
+# token_file = "auth/api-token"
+
+[data]
+root_dir = ".gg-runtime"
+sqlite_path = "runtime.sqlite3"
+logs_dir = "logs"
+providers_dir = "providers"
+
+[providers.codex]
+enabled = true
+max_instances = 4
+max_sessions_per_instance = 8
+
+[providers.claude]
+enabled = true
+max_instances = 4
+max_sessions_per_instance = 4
+
+# Claude auth mode:
+# - "host_machine" (default): use host credentials from machine login flow (`claude login`)
+# - "runtime_managed": use runtime-managed credential/config paths by default
+claude_auth_mode = "host_machine"
+
+[events]
+live_queue_capacity = 4096
+critical_queue_capacity = 16384
+team_queue_capacity = 8192
+
+[processes]
+enabled = true
+max_concurrent = 32
+default_timeout_ms = 600000
+max_output_bytes_per_process = 20000000
+allow_shell = true
+
+[worktrees]
+enabled = true
+root_dir = "worktrees"
+init_script_path = ".agents/gg/worktree-init.sh"
+deletion_policy_default = "delete_on_last_claim"

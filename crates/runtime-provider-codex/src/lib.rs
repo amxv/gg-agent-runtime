@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -65,6 +66,10 @@ pub struct CodexProvider {
 
 impl CodexProvider {
     pub fn new(config: CodexProviderConfig) -> Self {
+        let config = CodexProviderConfig {
+            home_dir: absolutize_path(config.home_dir.as_path()),
+            ..config
+        };
         Self {
             inner: Arc::new(CodexProviderInner {
                 config,
@@ -110,20 +115,47 @@ impl CodexProvider {
         lines.join("\n\n")
     }
 
-    fn apply_execution_mode(command: &mut Command, permission_mode: Option<&str>) {
+    fn is_placeholder_provider_ref(provider_session_ref: &str) -> bool {
+        provider_session_ref.starts_with("runtime:")
+    }
+
+    fn build_turn_command_args(
+        last_message_path: &Path,
+        provider_session_ref: &str,
+        model: Option<&str>,
+        permission_mode: Option<&str>,
+        prompt: &str,
+    ) -> Vec<OsString> {
+        let mut args = Vec::new();
+        args.push(OsString::from("exec"));
+
+        if !Self::is_placeholder_provider_ref(provider_session_ref) {
+            args.push(OsString::from("resume"));
+        }
+
+        args.push(OsString::from("--json"));
+        args.push(OsString::from("--skip-git-repo-check"));
+        args.push(OsString::from("-o"));
+        args.push(last_message_path.as_os_str().to_os_string());
+
+        if let Some(model) = model {
+            args.push(OsString::from("-m"));
+            args.push(OsString::from(model));
+        }
+
         match permission_mode {
-            Some("full_auto") => {
-                command.arg("--full-auto");
-            }
+            Some("full_auto") => args.push(OsString::from("--full-auto")),
             Some("danger_full_access") | Some("danger-full-access") => {
-                command.arg("--dangerously-bypass-approvals-and-sandbox");
+                args.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"))
             }
             _ => {}
         }
-    }
 
-    fn is_placeholder_provider_ref(provider_session_ref: &str) -> bool {
-        provider_session_ref.starts_with("runtime:")
+        if !Self::is_placeholder_provider_ref(provider_session_ref) {
+            args.push(OsString::from(provider_session_ref));
+        }
+        args.push(OsString::from(prompt));
+        args
     }
 
     fn spawn_turn(
@@ -151,32 +183,15 @@ impl CodexProvider {
 
         let mut command = Command::new("codex");
         command.env("CODEX_HOME", self.inner.config.home_dir.as_os_str());
-        command.arg("-o");
-        command.arg(last_message_path.as_os_str());
-
         let provider_ref = session.provider_session_ref.clone();
-        if Self::is_placeholder_provider_ref(provider_ref.as_str()) {
-            command.arg("exec");
-            command.arg("--json");
-            command.arg("--skip-git-repo-check");
-            if let Some(model) = session.model.as_ref() {
-                command.arg("-m");
-                command.arg(model);
-            }
-            Self::apply_execution_mode(&mut command, session.permission_mode.as_deref());
-            command.arg(prompt);
-        } else {
-            command.arg("exec");
-            command.arg("resume");
-            command.arg("--json");
-            command.arg("--skip-git-repo-check");
-            if let Some(model) = session.model.as_ref() {
-                command.arg("-m");
-                command.arg(model);
-            }
-            Self::apply_execution_mode(&mut command, session.permission_mode.as_deref());
-            command.arg(provider_ref);
-            command.arg(prompt);
+        for arg in Self::build_turn_command_args(
+            last_message_path.as_path(),
+            provider_ref.as_str(),
+            session.model.as_deref(),
+            session.permission_mode.as_deref(),
+            prompt.as_str(),
+        ) {
+            command.arg(arg);
         }
 
         if let Some(cwd) = session.cwd.as_ref() {
@@ -398,6 +413,16 @@ impl CodexProvider {
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
+    }
+}
+
+fn absolutize_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -795,6 +820,83 @@ mod tests {
     }
 
     #[test]
+    fn build_turn_command_args_places_output_flag_under_exec() {
+        let args = CodexProvider::build_turn_command_args(
+            Path::new("/tmp/last.txt"),
+            "runtime:session",
+            Some("gpt-5.4"),
+            Some("full_auto"),
+            "hello",
+        );
+        let args = args
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert!(args.contains(&"-o".to_string()));
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-o",
+                "/tmp/last.txt",
+                "-m",
+                "gpt-5.4",
+                "--full-auto",
+                "hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_turn_command_args_resume_includes_resume_subcommand_and_provider_ref() {
+        let args = CodexProvider::build_turn_command_args(
+            Path::new("/tmp/last.txt"),
+            "provider-session-123",
+            None,
+            Some("danger-full-access"),
+            "continue",
+        );
+        let args = args
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert_eq!(args.get(1).map(String::as_str), Some("resume"));
+        assert!(args.contains(&"provider-session-123".to_string()));
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "-o",
+                "/tmp/last.txt",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "provider-session-123",
+                "continue",
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_new_absolutizes_relative_home_dir() {
+        let provider = CodexProvider::new(CodexProviderConfig {
+            enabled: true,
+            home_dir: PathBuf::from("tmp/relative-codex-home"),
+            max_transports: 1,
+            max_sessions_per_transport: 1,
+        });
+        assert!(
+            provider.inner.config.home_dir.is_absolute(),
+            "expected codex home dir to be absolute"
+        );
+    }
+
+    #[test]
     fn copy_auth_file_stages_into_runtime_home() {
         let source_dir = tempfile::tempdir().expect("source dir");
         let destination_dir = tempfile::tempdir().expect("destination dir");
@@ -823,7 +925,7 @@ mod tests {
         provider
             .create_session(ProviderCreateSessionRequest {
                 runtime_session_id: "sess_retry".to_string(),
-                model: Some("gpt-5.2-codex".to_string()),
+                model: Some("gpt-5.4-mini".to_string()),
                 cwd: Some(missing_cwd.display().to_string()),
                 permission_mode: None,
                 metadata: None,

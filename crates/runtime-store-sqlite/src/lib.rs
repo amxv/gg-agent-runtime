@@ -2637,7 +2637,7 @@ mod tests {
             provider: "codex".to_string(),
             status: "idle".to_string(),
             cwd: None,
-            model: Some("gpt-5.2-codex".to_string()),
+            model: Some("gpt-5.4-mini".to_string()),
             permission_mode: Some("default".to_string()),
             system_prompt: None,
             metadata: serde_json::json!({}),
