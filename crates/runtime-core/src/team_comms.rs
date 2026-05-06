@@ -40,6 +40,7 @@ enum DeliveryAttemptTrigger {
     Queue,
     Retry,
     TurnCompletedBoundary,
+    StartupRecovery,
 }
 
 #[derive(Default)]
@@ -183,6 +184,64 @@ impl RuntimeTeamCommsService {
         });
 
         Ok(service)
+    }
+
+    pub async fn recover_startup_deferred_deliveries(&self) -> Result<usize, RuntimeError> {
+        self.ensure_enabled()?;
+        let recipients = {
+            let state = self.state.read().await;
+            state
+                .recipient_delivery_ids
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let mut retried = 0usize;
+        for recipient_id in recipients {
+            let recipient_session = match self.runtime.get_session(recipient_id.as_str()).await {
+                Ok(session) => session,
+                Err(_) => continue,
+            };
+            if matches!(recipient_session.status.as_str(), "closed" | "failed") {
+                continue;
+            }
+            if recipient_session.active_turn_id.is_some() {
+                continue;
+            }
+            let deferred_ids = {
+                let state = self.state.read().await;
+                state
+                    .recipient_delivery_ids
+                    .get(recipient_id.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|delivery_id| {
+                        state
+                            .deliveries
+                            .get(delivery_id)
+                            .map(|delivery| delivery.status == DELIVERY_STATUS_DEFERRED)
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for delivery_id in deferred_ids {
+                if let Ok(updated) = self
+                    .inject_delivery(
+                        delivery_id.as_str(),
+                        DeliveryAttemptTrigger::StartupRecovery,
+                    )
+                    .await
+                {
+                    if updated.status != DELIVERY_STATUS_DEFERRED {
+                        retried += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(retried)
     }
 
     fn ensure_enabled(&self) -> Result<(), RuntimeError> {
@@ -2401,6 +2460,157 @@ mod tests {
         assert!(
             after.iter().any(|event| event.kind == "team.lead_changed"),
             "expected team.lead_changed event to append after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retries_deferred_delivery_for_ready_recipient() {
+        let store = Arc::new(TestStore::default());
+        let now = now_ms();
+
+        store
+            .upsert_session(&SessionRecord {
+                id: "sess_lead_seed".to_string(),
+                provider: "codex".to_string(),
+                status: "ready".to_string(),
+                cwd: None,
+                model: Some("test-model".to_string()),
+                permission_mode: None,
+                system_prompt: None,
+                metadata: serde_json::json!({}),
+                provider_session_ref: Some("provider-lead-seed".to_string()),
+                canonical_provider_session_ref: None,
+                active_turn_id: None,
+                worktree_id: None,
+                created_at: now,
+                updated_at: now,
+                closed_at: None,
+                failure_code: None,
+                failure_message: None,
+            })
+            .expect("seed lead session");
+        store
+            .upsert_session(&SessionRecord {
+                id: "sess_ready_seed".to_string(),
+                provider: "codex".to_string(),
+                status: "ready".to_string(),
+                cwd: None,
+                model: Some("test-model".to_string()),
+                permission_mode: None,
+                system_prompt: None,
+                metadata: serde_json::json!({}),
+                provider_session_ref: Some("provider-ready-seed".to_string()),
+                canonical_provider_session_ref: None,
+                active_turn_id: None,
+                worktree_id: None,
+                created_at: now,
+                updated_at: now,
+                closed_at: None,
+                failure_code: None,
+                failure_message: None,
+            })
+            .expect("seed recipient session");
+        store
+            .upsert_team(&TeamRecord {
+                id: "team_seed".to_string(),
+                name: "Seed Team".to_string(),
+                lead_agent_id: "sess_lead_seed".to_string(),
+                created_by: "test".to_string(),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            })
+            .expect("seed team");
+        store
+            .upsert_team_member(&TeamMemberRecord {
+                team_id: "team_seed".to_string(),
+                agent_id: "sess_ready_seed".to_string(),
+                title: None,
+                joined_at: now,
+                added_by: "test".to_string(),
+                creator_agent_id: None,
+                creator_compaction_subscription: "auto".to_string(),
+                worktree_id: None,
+            })
+            .expect("seed member");
+        store
+            .upsert_team_message(&TeamMessageRecord {
+                id: "msg_seed".to_string(),
+                team_id: "team_seed".to_string(),
+                scope: "direct".to_string(),
+                sender_agent_id: "sess_lead_seed".to_string(),
+                recipient_agent_ids: serde_json::json!(["sess_ready_seed"]),
+                input: serde_json::json!([{ "type": "text", "text": "seed deferred" }]),
+                image_paths: serde_json::json!([]),
+                priority: "normal".to_string(),
+                policy: "non_interrupting".to_string(),
+                correlation_id: None,
+                reply_to_message_id: None,
+                idempotency_key: Some("seed-idempotency".to_string()),
+                created_at: now,
+            })
+            .expect("seed message");
+        store
+            .upsert_team_delivery(&TeamDeliveryRecord {
+                id: "dlv_seed".to_string(),
+                message_id: "msg_seed".to_string(),
+                team_id: "team_seed".to_string(),
+                recipient_agent_id: "sess_ready_seed".to_string(),
+                provider: "codex".to_string(),
+                status: DELIVERY_STATUS_DEFERRED.to_string(),
+                effective_policy: Some("non_interrupting".to_string()),
+                injection_strategy: None,
+                injected_turn_id: None,
+                last_error_code: Some("seed_restart_gap".to_string()),
+                last_error_message: Some("seed deferred before restart".to_string()),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("seed delivery");
+
+        let (_runtime, service) = build_runtime_and_service(store.clone(), 0);
+        let before = service
+            .get_deliveries(TeamGetDeliveriesRequest {
+                team_id: "team_seed".to_string(),
+                message_id: Some("msg_seed".to_string()),
+                recipient_agent_id: Some("sess_ready_seed".to_string()),
+            })
+            .await
+            .expect("delivery before startup replay");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, DELIVERY_STATUS_DEFERRED);
+
+        let retried = service
+            .recover_startup_deferred_deliveries()
+            .await
+            .expect("startup deferred recovery");
+        assert!(
+            retried >= 1,
+            "expected startup replay to retry at least one deferred delivery"
+        );
+
+        let mut recovered_status = None;
+        for _ in 0..30 {
+            let rows = service
+                .get_deliveries(TeamGetDeliveriesRequest {
+                    team_id: "team_seed".to_string(),
+                    message_id: Some("msg_seed".to_string()),
+                    recipient_agent_id: Some("sess_ready_seed".to_string()),
+                })
+                .await
+                .expect("delivery rows");
+            if let Some(row) = rows.first() {
+                recovered_status = Some(row.status.clone());
+                if row.status != DELIVERY_STATUS_DEFERRED {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_ne!(
+            recovered_status.as_deref(),
+            Some(DELIVERY_STATUS_DEFERRED),
+            "deferred delivery should not remain permanently deferred after startup recovery"
         );
     }
 

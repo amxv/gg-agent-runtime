@@ -19,7 +19,7 @@ pub use provider::{
 pub use provider_registry::ProviderRegistry;
 pub use runtime::{
     ApprovalResponseInput, CreateSessionInput, ResumeSessionInput, RuntimeSessionManager,
-    SendTurnAccepted, SendTurnInput,
+    SendTurnAccepted, SendTurnInput, StartupRecoveryProviderStatus, StartupRecoverySummary,
 };
 pub use services::{
     ProcessDetails, ProcessGetRequest, ProcessKillRequest, ProcessListRequest,

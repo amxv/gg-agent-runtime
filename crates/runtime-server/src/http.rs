@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -12,12 +13,12 @@ use runtime_core::{
     ApprovalResponseInput, CreateSessionInput, ProcessGetRequest, ProcessKillRequest,
     ProcessListRequest, ProcessLogReadRequest, ProcessRunRequest, ProviderKind, ResumeSessionInput,
     RuntimeApp, RuntimeError, RuntimeEventRecord, RuntimeEventScope, RuntimeSessionManager,
-    SendTurnAccepted, SendTurnInput, TeamBroadcastRequest, TeamCancelMessageRequest,
-    TeamCreateRequest, TeamDeliveryRecord, TeamGetDeliveriesRequest, TeamInterruptAllRequest,
-    TeamJoinRequest, TeamListMessagesRequest, TeamMemberSpawnRequest, TeamMemberSpawnResponse,
-    TeamMemberSpawnWorktreeInput, TeamRemoveMemberRequest, TeamRetryDeliveryRequest,
-    TeamSendDirectRequest, TeamSetLeadRequest, TeamViewSnapshotRequest, ToolInvokeRequest,
-    WorktreeClaimRequest, WorktreeCleanupRequest, WorktreeCreateRequest,
+    SendTurnAccepted, SendTurnInput, StartupRecoverySummary, TeamBroadcastRequest,
+    TeamCancelMessageRequest, TeamCreateRequest, TeamDeliveryRecord, TeamGetDeliveriesRequest,
+    TeamInterruptAllRequest, TeamJoinRequest, TeamListMessagesRequest, TeamMemberSpawnRequest,
+    TeamMemberSpawnResponse, TeamMemberSpawnWorktreeInput, TeamRemoveMemberRequest,
+    TeamRetryDeliveryRequest, TeamSendDirectRequest, TeamSetLeadRequest, TeamViewSnapshotRequest,
+    ToolInvokeRequest, WorktreeClaimRequest, WorktreeCleanupRequest, WorktreeCreateRequest,
     WorktreeMemberRemovedRequest, WorktreeReleaseRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ pub struct AppState {
     pub runtime: Arc<RuntimeSessionManager>,
     pub bearer_token: String,
     pub public_base_url: String,
+    pub startup_recovery: Arc<StartupRecoverySummary>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -93,6 +95,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/worktrees/{worktree_id}/claims", post(claim_worktree))
         .route("/worktrees/{worktree_id}/release", post(release_worktree))
         .route("/worktrees/{worktree_id}/cleanup", post(cleanup_worktree))
+        .route("/diagnostics", get(runtime_diagnostics))
+        .route("/diagnostics/providers", get(provider_diagnostics))
+        .route("/diagnostics/comms", get(comms_diagnostics))
+        .route("/diagnostics/processes", get(process_diagnostics))
+        .route("/diagnostics/worktrees", get(worktree_diagnostics))
+        .route("/diagnostics/recovery", get(recovery_diagnostics))
         .route(
             "/diagnostics/team-operations",
             get(list_team_operation_diagnostics),
@@ -456,10 +464,7 @@ async fn stream_session_events(
 
     // Subscribe before replay to avoid missing events appended during replay/live handoff.
     let receiver = state.runtime.subscribe_events();
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok());
+    let last_event_id = parse_last_event_id_header(&headers)?;
     let cursor = query.after_seq.or(last_event_id);
     let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
     let mut replay_events = Vec::new();
@@ -546,10 +551,7 @@ async fn stream_global_events(
     headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
 {
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok());
+    let last_event_id = parse_last_event_id_header(&headers)?;
     let cursor = query.after_seq.or(last_event_id);
     let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
     let mut replay_events = Vec::new();
@@ -1035,10 +1037,7 @@ async fn stream_team_events(
         .await
         .map_err(ApiError::from)?;
 
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok());
+    let last_event_id = parse_last_event_id_header(&headers)?;
     let cursor = query.after_seq.or(last_event_id);
     let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
     let mut replay_events = Vec::new();
@@ -1267,6 +1266,305 @@ async fn cleanup_worktree(
     Ok(Json(response))
 }
 
+#[derive(Debug, Serialize)]
+struct RuntimeDiagnosticsResponse {
+    providers: ProviderDiagnosticsResponse,
+    comms: CommsDiagnosticsResponse,
+    processes: ProcessDiagnosticsResponse,
+    worktrees: WorktreeDiagnosticsResponse,
+    recovery: RecoveryDiagnosticsResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderDiagnosticEntry {
+    provider: String,
+    healthy: bool,
+    health_error: Option<String>,
+    auth_status: Option<runtime_core::ProviderAuthStatus>,
+    auth_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderDiagnosticsResponse {
+    providers: Vec<ProviderDiagnosticEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommsDiagnosticsResponse {
+    team_count: usize,
+    member_count: usize,
+    message_count: usize,
+    delivery_total: usize,
+    delivery_status_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessDiagnosticsResponse {
+    process_total: usize,
+    process_status_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorktreeDiagnosticsResponse {
+    worktree_total: usize,
+    active_claim_total: usize,
+    orphaned_claim_total: usize,
+    deletion_policy_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryDiagnosticsResponse {
+    startup: StartupRecoverySummary,
+    active_anomalies: Vec<String>,
+}
+
+async fn runtime_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<RuntimeDiagnosticsResponse>, ApiError> {
+    let providers = provider_diagnostics_internal(&state).await;
+    let (comms, processes, worktrees, recovery) = diagnostics_from_hydrated_state(&state)?;
+    Ok(Json(RuntimeDiagnosticsResponse {
+        providers,
+        comms,
+        processes,
+        worktrees,
+        recovery,
+    }))
+}
+
+async fn provider_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderDiagnosticsResponse>, ApiError> {
+    Ok(Json(provider_diagnostics_internal(&state).await))
+}
+
+async fn comms_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<CommsDiagnosticsResponse>, ApiError> {
+    let (comms, _, _, _) = diagnostics_from_hydrated_state(&state)?;
+    Ok(Json(comms))
+}
+
+async fn process_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<ProcessDiagnosticsResponse>, ApiError> {
+    let (_, processes, _, _) = diagnostics_from_hydrated_state(&state)?;
+    Ok(Json(processes))
+}
+
+async fn worktree_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<WorktreeDiagnosticsResponse>, ApiError> {
+    let (_, _, worktrees, _) = diagnostics_from_hydrated_state(&state)?;
+    Ok(Json(worktrees))
+}
+
+async fn recovery_diagnostics(
+    State(state): State<AppState>,
+) -> Result<Json<RecoveryDiagnosticsResponse>, ApiError> {
+    let (_, _, _, recovery) = diagnostics_from_hydrated_state(&state)?;
+    Ok(Json(recovery))
+}
+
+async fn provider_diagnostics_internal(state: &AppState) -> ProviderDiagnosticsResponse {
+    let mut rows = Vec::new();
+    for provider in state.app.provider_registry.metadata() {
+        let adapter = state.app.provider_registry.get(provider.kind);
+        let mut healthy = false;
+        let mut health_error = None;
+        let mut auth_status = None;
+        let mut auth_error = None;
+        if let Some(adapter) = adapter {
+            match adapter.healthcheck().await {
+                Ok(()) => healthy = true,
+                Err(error) => health_error = Some(error.to_string()),
+            }
+            match state.runtime.provider_auth_status(provider.kind).await {
+                Ok(status) => auth_status = Some(status),
+                Err(error) => auth_error = Some(error.to_string()),
+            }
+        } else {
+            health_error = Some("provider not registered".to_string());
+            auth_error = Some("provider not registered".to_string());
+        }
+        rows.push(ProviderDiagnosticEntry {
+            provider: provider.kind.as_str().to_string(),
+            healthy,
+            health_error,
+            auth_status,
+            auth_error,
+        });
+    }
+    ProviderDiagnosticsResponse { providers: rows }
+}
+
+fn diagnostics_from_hydrated_state(
+    state: &AppState,
+) -> Result<
+    (
+        CommsDiagnosticsResponse,
+        ProcessDiagnosticsResponse,
+        WorktreeDiagnosticsResponse,
+        RecoveryDiagnosticsResponse,
+    ),
+    ApiError,
+> {
+    let hydrated = state
+        .app
+        .services
+        .store
+        .hydrate_runtime_state()
+        .map_err(ApiError::from)?;
+
+    let mut delivery_status_counts = BTreeMap::<String, usize>::new();
+    for delivery in &hydrated.team_deliveries {
+        *delivery_status_counts
+            .entry(delivery.status.clone())
+            .or_insert(0) += 1;
+    }
+    let comms = CommsDiagnosticsResponse {
+        team_count: hydrated.teams.len(),
+        member_count: hydrated.team_members.len(),
+        message_count: hydrated.team_messages.len(),
+        delivery_total: hydrated.team_deliveries.len(),
+        delivery_status_counts,
+    };
+
+    let mut process_status_counts = BTreeMap::<String, usize>::new();
+    for process in &hydrated.processes {
+        *process_status_counts
+            .entry(process.status.clone())
+            .or_insert(0) += 1;
+    }
+    let processes = ProcessDiagnosticsResponse {
+        process_total: hydrated.processes.len(),
+        process_status_counts,
+    };
+
+    let mut deletion_policy_counts = BTreeMap::<String, usize>::new();
+    for worktree in &hydrated.managed_worktrees {
+        *deletion_policy_counts
+            .entry(worktree.deletion_policy.clone())
+            .or_insert(0) += 1;
+    }
+
+    let known_sessions = hydrated
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let known_worktrees = hydrated
+        .managed_worktrees
+        .iter()
+        .map(|worktree| worktree.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let orphaned_claim_total = hydrated
+        .managed_worktree_claims
+        .iter()
+        .filter(|claim| {
+            claim.released_at.is_none()
+                && (!known_sessions.contains(claim.session_id.as_str())
+                    || !known_worktrees.contains(claim.worktree_id.as_str()))
+        })
+        .count();
+
+    let worktrees = WorktreeDiagnosticsResponse {
+        worktree_total: hydrated.managed_worktrees.len(),
+        active_claim_total: hydrated
+            .managed_worktree_claims
+            .iter()
+            .filter(|claim| claim.released_at.is_none())
+            .count(),
+        orphaned_claim_total,
+        deletion_policy_counts,
+    };
+
+    let recovery = RecoveryDiagnosticsResponse {
+        startup: (*state.startup_recovery).clone(),
+        active_anomalies: collect_recovery_anomalies(&hydrated),
+    };
+    Ok((comms, processes, worktrees, recovery))
+}
+
+fn collect_recovery_anomalies(hydrated: &runtime_core::RuntimeHydratedState) -> Vec<String> {
+    let mut anomalies = Vec::new();
+    let turn_by_id = hydrated
+        .turns
+        .iter()
+        .map(|turn| (turn.id.as_str(), turn))
+        .collect::<std::collections::HashMap<_, _>>();
+    let session_ids = hydrated
+        .sessions
+        .iter()
+        .map(|session| session.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    for session in &hydrated.sessions {
+        if let Some(active_turn_id) = session.active_turn_id.as_deref() {
+            match turn_by_id.get(active_turn_id) {
+                None => anomalies.push(format!(
+                    "session {} references missing active turn {}",
+                    session.id, active_turn_id
+                )),
+                Some(turn) if turn.session_id != session.id => anomalies.push(format!(
+                    "session {} active turn {} belongs to {}",
+                    session.id, active_turn_id, turn.session_id
+                )),
+                Some(turn)
+                    if matches!(turn.status.as_str(), "completed" | "interrupted" | "failed") =>
+                {
+                    anomalies.push(format!(
+                        "session {} retains terminal active turn {} ({})",
+                        session.id, active_turn_id, turn.status
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for approval in &hydrated.approvals {
+        if approval.status != "pending" {
+            continue;
+        }
+        match turn_by_id.get(approval.turn_id.as_str()) {
+            None => anomalies.push(format!(
+                "pending approval {} references missing turn {}",
+                approval.id, approval.turn_id
+            )),
+            Some(turn)
+                if matches!(turn.status.as_str(), "completed" | "interrupted" | "failed") =>
+            {
+                anomalies.push(format!(
+                    "pending approval {} references terminal turn {} ({})",
+                    approval.id, turn.id, turn.status
+                ))
+            }
+            _ => {}
+        }
+    }
+
+    for claim in &hydrated.managed_worktree_claims {
+        if claim.released_at.is_none() && !session_ids.contains(claim.session_id.as_str()) {
+            anomalies.push(format!(
+                "active worktree claim {} -> {} references missing session",
+                claim.worktree_id, claim.session_id
+            ));
+        }
+    }
+
+    for process in &hydrated.processes {
+        if matches!(process.status.as_str(), "queued" | "running") {
+            anomalies.push(format!(
+                "process {} remained {} across restart",
+                process.id, process.status
+            ));
+        }
+    }
+
+    anomalies
+}
+
 #[derive(Debug, Deserialize)]
 struct TeamOperationDiagnosticsQuery {
     team_id: Option<String>,
@@ -1426,10 +1724,7 @@ async fn stream_process_events(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError>
 {
     let receiver = state.app.services.process_manager.subscribe_events();
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i64>().ok());
+    let last_event_id = parse_last_event_id_header(&headers)?;
     let cursor = query.after_seq.or(last_event_id);
     let replay_page_limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
     let mut replay_events = Vec::new();
@@ -1600,6 +1895,28 @@ fn parse_provider_kind(value: &str) -> Result<ProviderKind, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("unknown provider {}", value)))
 }
 
+fn parse_last_event_id_header(headers: &HeaderMap) -> Result<Option<i64>, ApiError> {
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("invalid last-event-id header encoding".to_string()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = trimmed.parse::<i64>().map_err(|_| {
+        ApiError::bad_request("invalid last-event-id header; expected integer".to_string())
+    })?;
+    if parsed < 0 {
+        return Err(ApiError::bad_request(
+            "invalid last-event-id header; expected non-negative integer".to_string(),
+        ));
+    }
+    Ok(Some(parsed))
+}
+
 async fn bearer_auth(
     State(expected_token): State<String>,
     request: Request<Body>,
@@ -1615,7 +1932,13 @@ async fn bearer_auth(
         return next.run(request).await;
     }
 
-    (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "missing or invalid bearer token",
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug)]
@@ -2207,6 +2530,7 @@ mod tests {
             runtime,
             bearer_token: bearer_token.clone(),
             public_base_url: "http://localhost:8080".to_string(),
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         (router, bearer_token, temp_dir)
@@ -2304,6 +2628,7 @@ mod tests {
             runtime,
             bearer_token: bearer_token.clone(),
             public_base_url: "http://localhost:8080".to_string(),
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         (router, bearer_token, temp_dir)
@@ -2322,6 +2647,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let response = router
@@ -2814,6 +3140,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: bootstrapped.auth.bearer_token,
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let response = router
@@ -2842,6 +3169,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let unauthorized = router
@@ -2867,6 +3195,76 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_routes_return_structured_runtime_state() {
+        let (router, token, _temp_dir) = build_test_router().await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/diagnostics")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("diagnostics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("diagnostics body");
+        let json: Value = serde_json::from_slice(body.as_ref()).expect("diagnostics json");
+        assert!(json.get("providers").is_some());
+        assert!(json.get("comms").is_some());
+        assert!(json.get("processes").is_some());
+        assert!(json.get("worktrees").is_some());
+        assert!(json.get("recovery").is_some());
+
+        let recovery = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/diagnostics/recovery")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("recovery diagnostics response");
+        assert_eq!(recovery.status(), StatusCode::OK);
+        let recovery_body = to_bytes(recovery.into_body(), usize::MAX)
+            .await
+            .expect("recovery body");
+        let recovery_json: Value =
+            serde_json::from_slice(recovery_body.as_ref()).expect("recovery json");
+        assert!(recovery_json.get("startup").is_some());
+        assert!(recovery_json.get("active_anomalies").is_some());
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_invalid_last_event_id_header() {
+        let (router, token, _temp_dir) = build_test_router().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events/stream")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header("last-event-id", "not-an-integer")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("sse response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: Value = serde_json::from_slice(body.as_ref()).expect("json");
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("invalid last-event-id header; expected integer")
+        );
     }
 
     #[tokio::test]
@@ -2906,6 +3304,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let initial_status = router
@@ -3116,6 +3515,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
         let smoke_server_router = router.clone();
         let smoke_server_handle = tokio::spawn(async move {
@@ -4444,6 +4844,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let create_body = serde_json::json!({
@@ -4615,6 +5016,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let auth_status_response = router
@@ -4845,6 +5247,7 @@ mod tests {
             runtime: restarted.runtime,
             bearer_token: restarted_token.clone(),
             public_base_url: restarted.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let resume_response = restarted_router
@@ -5759,6 +6162,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let create_session = |router: Router, token: String, cwd: String| async move {
@@ -6387,6 +6791,7 @@ mod tests {
             runtime: bootstrapped.runtime,
             bearer_token: token.clone(),
             public_base_url: bootstrapped.public_base_url,
+            startup_recovery: Arc::new(runtime_core::StartupRecoverySummary::default()),
         });
 
         let lead_session_response = router

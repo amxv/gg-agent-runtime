@@ -50,6 +50,30 @@ pub struct SendTurnAccepted {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartupRecoveryProviderStatus {
+    pub provider: String,
+    pub healthy: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartupRecoverySummary {
+    pub started_at: i64,
+    pub completed_at: i64,
+    pub sessions_scanned: usize,
+    pub turns_scanned: usize,
+    pub approvals_scanned: usize,
+    pub sessions_reconciled: usize,
+    pub turns_reconciled: usize,
+    pub approvals_reconciled: usize,
+    pub resumed_sessions: usize,
+    pub resumed_waits: usize,
+    pub deferred_deliveries_retried: usize,
+    pub provider_status: Vec<StartupRecoveryProviderStatus>,
+    pub notes: Vec<String>,
+}
+
 pub struct RuntimeSessionManager {
     store: Arc<dyn RuntimeStore>,
     providers: Arc<ProviderRegistry>,
@@ -97,6 +121,268 @@ impl RuntimeSessionManager {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<RuntimeEventRecord> {
         self.event_tx.subscribe()
+    }
+
+    pub async fn recover_startup(self: &Arc<Self>) -> Result<StartupRecoverySummary, RuntimeError> {
+        let started_at = now_ms();
+        let mut summary = StartupRecoverySummary {
+            started_at,
+            ..Default::default()
+        };
+        let turns_snapshot = self.turns.read().await.clone();
+        let approvals_snapshot = self.approvals.read().await.clone();
+        let session_ids = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        summary.turns_scanned = turns_snapshot.len();
+        summary.approvals_scanned = approvals_snapshot.len();
+        summary.sessions_scanned = session_ids.len();
+
+        for provider in self.providers.metadata() {
+            let status = match self.providers.get(provider.kind) {
+                Some(adapter) => match adapter.healthcheck().await {
+                    Ok(()) => StartupRecoveryProviderStatus {
+                        provider: provider.kind.as_str().to_string(),
+                        healthy: true,
+                        detail: None,
+                    },
+                    Err(error) => StartupRecoveryProviderStatus {
+                        provider: provider.kind.as_str().to_string(),
+                        healthy: false,
+                        detail: Some(error.to_string()),
+                    },
+                },
+                None => StartupRecoveryProviderStatus {
+                    provider: provider.kind.as_str().to_string(),
+                    healthy: false,
+                    detail: Some("provider not registered".to_string()),
+                },
+            };
+            summary.provider_status.push(status);
+        }
+
+        for session_id in session_ids {
+            let session = match self.get_session(session_id.as_str()).await {
+                Ok(session) => session,
+                Err(_) => continue,
+            };
+
+            let mut updated_session = session.clone();
+            let mut session_changed = false;
+
+            if !matches!(session.status.as_str(), "closed" | "failed") {
+                if let Some(provider_session_ref) = session.provider_session_ref.clone() {
+                    let provider_kind = ProviderKind::from_str(session.provider.as_str())
+                        .ok_or_else(|| {
+                            RuntimeError::ProtocolViolation(format!(
+                                "unknown provider {}",
+                                session.provider
+                            ))
+                        })?;
+                    if let Some(provider) = self.providers.get(provider_kind) {
+                        match provider
+                            .resume_session(ProviderResumeSessionRequest {
+                                runtime_session_id: session.id.clone(),
+                                provider_session_ref,
+                                canonical_provider_session_ref: session
+                                    .canonical_provider_session_ref
+                                    .clone(),
+                                cwd: session.cwd.clone(),
+                                metadata: Some(session.metadata.clone()),
+                            })
+                            .await
+                        {
+                            Ok(resumed) => {
+                                summary.resumed_sessions += 1;
+                                if updated_session.provider_session_ref
+                                    != Some(resumed.provider_session_ref.clone())
+                                {
+                                    updated_session.provider_session_ref =
+                                        Some(resumed.provider_session_ref);
+                                    session_changed = true;
+                                }
+                                if updated_session.canonical_provider_session_ref
+                                    != resumed.canonical_provider_session_ref
+                                {
+                                    updated_session.canonical_provider_session_ref =
+                                        resumed.canonical_provider_session_ref;
+                                    session_changed = true;
+                                }
+                            }
+                            Err(error) => {
+                                updated_session.status = "failed".to_string();
+                                updated_session.failure_code =
+                                    Some("startup_provider_resume_failed".to_string());
+                                updated_session.failure_message = Some(error.to_string());
+                                updated_session.active_turn_id = None;
+                                session_changed = true;
+                                summary.notes.push(format!(
+                                    "session {} marked failed: {}",
+                                    session.id, error
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    updated_session.status = "failed".to_string();
+                    updated_session.failure_code = Some("startup_missing_provider_ref".to_string());
+                    updated_session.failure_message =
+                        Some("missing provider_session_ref".to_string());
+                    updated_session.active_turn_id = None;
+                    session_changed = true;
+                }
+            }
+
+            let pending_approval_for_turn = |turn_id: &str| -> bool {
+                approvals_snapshot.values().any(|approval| {
+                    approval.turn_id == turn_id
+                        && approval.session_id == session.id
+                        && approval.status == "pending"
+                })
+            };
+
+            if let Some(active_turn_id) = updated_session.active_turn_id.clone() {
+                match turns_snapshot.get(active_turn_id.as_str()) {
+                    None => {
+                        updated_session.active_turn_id = None;
+                        if !matches!(updated_session.status.as_str(), "closed" | "failed") {
+                            updated_session.status = "ready".to_string();
+                        }
+                        session_changed = true;
+                        summary.notes.push(format!(
+                            "session {} cleared stale active turn {}",
+                            session.id, active_turn_id
+                        ));
+                    }
+                    Some(turn) if turn.session_id != session.id => {
+                        updated_session.active_turn_id = None;
+                        updated_session.status = "failed".to_string();
+                        updated_session.failure_code =
+                            Some("startup_turn_ownership_mismatch".to_string());
+                        updated_session.failure_message =
+                            Some(format!("turn {} belongs to {}", turn.id, turn.session_id));
+                        session_changed = true;
+                    }
+                    Some(turn) if is_terminal_turn_status(turn.status.as_str()) => {
+                        updated_session.active_turn_id = None;
+                        if !matches!(updated_session.status.as_str(), "closed" | "failed") {
+                            updated_session.status = "ready".to_string();
+                        }
+                        session_changed = true;
+                    }
+                    Some(turn) if turn.status == "waiting_for_approval" => {
+                        if pending_approval_for_turn(turn.id.as_str()) {
+                            if updated_session.status != "waiting_for_approval" {
+                                updated_session.status = "waiting_for_approval".to_string();
+                                session_changed = true;
+                            }
+                        } else {
+                            let mut repaired = turn.clone();
+                            repaired.status = "failed".to_string();
+                            repaired.completed_at = Some(now_ms());
+                            repaired.error = Some(serde_json::json!({
+                                "message": "startup recovery: missing pending approval",
+                            }));
+                            self.store.upsert_turn(&repaired)?;
+                            {
+                                let mut turns = self.turns.write().await;
+                                turns.insert(repaired.id.clone(), repaired);
+                            }
+                            summary.turns_reconciled += 1;
+                            updated_session.active_turn_id = None;
+                            if !matches!(updated_session.status.as_str(), "closed" | "failed") {
+                                updated_session.status = "ready".to_string();
+                            }
+                            session_changed = true;
+                        }
+                    }
+                    Some(turn) => {
+                        if !matches!(updated_session.status.as_str(), "closed" | "failed") {
+                            updated_session.status = "turn_running".to_string();
+                        }
+                        let provider_kind = ProviderKind::from_str(session.provider.as_str())
+                            .ok_or_else(|| {
+                                RuntimeError::ProtocolViolation(format!(
+                                    "unknown provider {}",
+                                    session.provider
+                                ))
+                            })?;
+                        summary.resumed_waits += 1;
+                        self.spawn_wait_for_turn(
+                            provider_kind,
+                            session.id.clone(),
+                            turn.id.clone(),
+                        );
+                    }
+                }
+            } else if matches!(
+                updated_session.status.as_str(),
+                "turn_running" | "waiting_for_approval"
+            ) {
+                updated_session.status = "ready".to_string();
+                session_changed = true;
+            }
+
+            if session_changed {
+                updated_session.updated_at = now_ms();
+                self.store.upsert_session(&updated_session)?;
+                {
+                    let mut sessions = self.sessions.write().await;
+                    sessions.insert(updated_session.id.clone(), updated_session.clone());
+                }
+                summary.sessions_reconciled += 1;
+            }
+        }
+
+        let approval_ids = approvals_snapshot.keys().cloned().collect::<Vec<_>>();
+        for approval_id in approval_ids {
+            let Some(approval) = approvals_snapshot.get(approval_id.as_str()) else {
+                continue;
+            };
+            if approval.status != "pending" {
+                continue;
+            }
+            let turn = turns_snapshot.get(approval.turn_id.as_str());
+            if turn.is_none()
+                || turn.is_some_and(|turn| is_terminal_turn_status(turn.status.as_str()))
+            {
+                let mut resolved = approval.clone();
+                resolved.status = "decline".to_string();
+                resolved.resolved_at = Some(now_ms());
+                resolved.response = Some(serde_json::json!({
+                    "reason": "startup_recovery_orphaned_approval",
+                }));
+                self.store.upsert_approval(&resolved)?;
+                {
+                    let mut approvals = self.approvals.write().await;
+                    approvals.insert(resolved.id.clone(), resolved);
+                }
+                summary.approvals_reconciled += 1;
+            }
+        }
+
+        summary.completed_at = now_ms();
+        Ok(summary)
+    }
+
+    pub async fn emit_startup_recovered_event(
+        &self,
+        summary: &StartupRecoverySummary,
+    ) -> Result<RuntimeEventRecord, RuntimeError> {
+        self.append_event(
+            RuntimeEventScope::System,
+            "startup_recovery",
+            None,
+            None,
+            "runtime.startup_recovered",
+            RuntimeEventCriticality::Critical,
+            serde_json::json!({ "summary": summary }),
+        )
+        .await
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionRecord> {
@@ -1442,6 +1728,24 @@ mod tests {
         )
     }
 
+    fn manager_with_provider_and_store(
+        wait_delay_ms: u64,
+    ) -> (Arc<RuntimeSessionManager>, Arc<MockStore>) {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(Arc::new(MockProvider {
+                wait_delay_ms,
+                fail_send: false,
+            }))
+            .expect("register provider");
+        let store = Arc::new(MockStore::default());
+        let manager = Arc::new(
+            RuntimeSessionManager::new(store.clone(), Arc::new(registry), 256)
+                .expect("build runtime manager"),
+        );
+        (manager, store)
+    }
+
     fn manager_with_failing_send_provider() -> Arc<RuntimeSessionManager> {
         let mut registry = ProviderRegistry::new();
         registry
@@ -1867,6 +2171,207 @@ mod tests {
         assert!(
             events.iter().any(|event| event.kind == "session.resumed"),
             "session.resumed event missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_clears_stale_active_turn_and_orphaned_pending_approval() {
+        let (manager, store) = manager_with_provider_and_store(0);
+        let now = now_ms();
+        store
+            .upsert_session(&SessionRecord {
+                id: "sess_recover".to_string(),
+                provider: "codex".to_string(),
+                status: "turn_running".to_string(),
+                cwd: None,
+                model: None,
+                permission_mode: None,
+                system_prompt: None,
+                metadata: serde_json::json!({}),
+                provider_session_ref: Some("provider_ref_1".to_string()),
+                canonical_provider_session_ref: None,
+                active_turn_id: Some("turn_missing".to_string()),
+                worktree_id: None,
+                created_at: now,
+                updated_at: now,
+                closed_at: None,
+                failure_code: None,
+                failure_message: None,
+            })
+            .expect("seed session");
+        store
+            .upsert_approval(&ApprovalRecord {
+                id: "apr_orphan".to_string(),
+                session_id: "sess_recover".to_string(),
+                turn_id: "turn_missing".to_string(),
+                tool_call_id: None,
+                provider_approval_ref: None,
+                status: "pending".to_string(),
+                request: serde_json::json!({"reason":"manual"}),
+                response: None,
+                created_at: now,
+                resolved_at: None,
+            })
+            .expect("seed approval");
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert(
+                "sess_recover".to_string(),
+                store
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .get("sess_recover")
+                    .cloned()
+                    .expect("session seeded"),
+            );
+        }
+        {
+            let mut approvals = manager.approvals.write().await;
+            approvals.insert(
+                "apr_orphan".to_string(),
+                store
+                    .approvals
+                    .lock()
+                    .expect("approvals")
+                    .get("apr_orphan")
+                    .cloned()
+                    .expect("approval seeded"),
+            );
+        }
+
+        let summary = manager.recover_startup().await.expect("startup recovery");
+        assert!(summary.sessions_reconciled >= 1);
+        assert!(summary.approvals_reconciled >= 1);
+        let repaired = manager
+            .get_session("sess_recover")
+            .await
+            .expect("repaired session");
+        assert_eq!(repaired.active_turn_id, None);
+        assert_eq!(repaired.status, "ready");
+        let approvals = manager.approvals.read().await;
+        let approval = approvals.get("apr_orphan").expect("approval present");
+        assert_eq!(approval.status, "decline");
+        assert!(approval.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_preserves_waiting_for_approval_turn_without_spawning_wait() {
+        let (manager, store) = manager_with_provider_and_store(0);
+        let now = now_ms();
+        store
+            .upsert_session(&SessionRecord {
+                id: "sess_pending".to_string(),
+                provider: "codex".to_string(),
+                status: "waiting_for_approval".to_string(),
+                cwd: None,
+                model: None,
+                permission_mode: Some("require_approval".to_string()),
+                system_prompt: None,
+                metadata: serde_json::json!({}),
+                provider_session_ref: Some("provider_ref_pending".to_string()),
+                canonical_provider_session_ref: None,
+                active_turn_id: Some("turn_pending".to_string()),
+                worktree_id: None,
+                created_at: now,
+                updated_at: now,
+                closed_at: None,
+                failure_code: None,
+                failure_message: None,
+            })
+            .expect("seed waiting session");
+        store
+            .upsert_turn(&TurnRecord {
+                id: "turn_pending".to_string(),
+                session_id: "sess_pending".to_string(),
+                provider_turn_ref: None,
+                status: "waiting_for_approval".to_string(),
+                input: serde_json::json!([{ "type": "text", "text": "needs approval" }]),
+                source: Some("user".to_string()),
+                started_at: Some(now),
+                completed_at: None,
+                usage: None,
+                error: None,
+            })
+            .expect("seed waiting turn");
+        store
+            .upsert_approval(&ApprovalRecord {
+                id: "apr_pending".to_string(),
+                session_id: "sess_pending".to_string(),
+                turn_id: "turn_pending".to_string(),
+                tool_call_id: None,
+                provider_approval_ref: None,
+                status: "pending".to_string(),
+                request: serde_json::json!({"reason":"manual"}),
+                response: None,
+                created_at: now,
+                resolved_at: None,
+            })
+            .expect("seed pending approval");
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert(
+                "sess_pending".to_string(),
+                store
+                    .sessions
+                    .lock()
+                    .expect("sessions")
+                    .get("sess_pending")
+                    .cloned()
+                    .expect("session seeded"),
+            );
+        }
+        {
+            let mut turns = manager.turns.write().await;
+            turns.insert(
+                "turn_pending".to_string(),
+                store
+                    .turns
+                    .lock()
+                    .expect("turns")
+                    .get("turn_pending")
+                    .cloned()
+                    .expect("turn seeded"),
+            );
+        }
+        {
+            let mut approvals = manager.approvals.write().await;
+            approvals.insert(
+                "apr_pending".to_string(),
+                store
+                    .approvals
+                    .lock()
+                    .expect("approvals")
+                    .get("apr_pending")
+                    .cloned()
+                    .expect("approval seeded"),
+            );
+        }
+
+        let summary = manager.recover_startup().await.expect("startup recovery");
+        assert_eq!(summary.resumed_waits, 0);
+        let repaired = manager
+            .get_session("sess_pending")
+            .await
+            .expect("repaired session");
+        assert_eq!(repaired.status, "waiting_for_approval");
+        assert_eq!(repaired.active_turn_id.as_deref(), Some("turn_pending"));
+
+        let approvals = manager.approvals.read().await;
+        let approval = approvals.get("apr_pending").expect("approval present");
+        assert_eq!(approval.status, "pending");
+        assert!(approval.resolved_at.is_none());
+
+        let events = store.events.lock().expect("events lock").clone();
+        assert!(
+            !events.iter().any(|event| {
+                event.session_id.as_deref() == Some("sess_pending")
+                    && matches!(
+                        event.kind.as_str(),
+                        "turn.completed" | "turn.interrupted" | "turn.failed" | "provider.error"
+                    )
+            }),
+            "startup recovery must not terminally reconcile waiting-for-approval turns"
         );
     }
 }

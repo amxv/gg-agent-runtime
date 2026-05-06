@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use runtime_server::{
@@ -27,6 +28,7 @@ async fn main() -> Result<()> {
         runtime: bootstrapped.runtime,
         bearer_token: bootstrapped.auth.bearer_token,
         public_base_url: bootstrapped.public_base_url,
+        startup_recovery: Arc::new(bootstrapped.startup_recovery),
     };
 
     let router = build_router(state);

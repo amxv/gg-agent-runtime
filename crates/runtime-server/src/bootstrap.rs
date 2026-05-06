@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use runtime_core::{
     EventQueueLimits, ProcessLimits, ProviderRegistry, RuntimeApp, RuntimeServices,
     RuntimeSessionManager, RuntimeStore, RuntimeTeamCommsConfig, RuntimeTeamCommsService,
-    WorktreeSettings,
+    StartupRecoverySummary, WorktreeSettings,
 };
 use runtime_provider_claude::{
     standalone_claude_bridge_command_path, standalone_gg_mcp_server_command_path,
@@ -26,6 +26,7 @@ pub struct BootstrappedRuntime {
     pub auth: ResolvedAuth,
     pub bind_address: String,
     pub public_base_url: String,
+    pub startup_recovery: StartupRecoverySummary,
 }
 
 pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<BootstrappedRuntime> {
@@ -129,6 +130,10 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         )
         .context("failed to initialize runtime session manager")?,
     );
+    let mut startup_recovery = runtime
+        .recover_startup()
+        .await
+        .context("failed running startup recovery for session runtime")?;
 
     let process_manager = RuntimeProcessManager::new(
         store.clone(),
@@ -147,6 +152,14 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     )
     .await
     .context("failed to initialize process manager")?;
+    let recovered_processes = process_manager.startup_recovered_processes().await;
+    if !recovered_processes.is_empty() {
+        startup_recovery.notes.push(format!(
+            "startup process recovery marked {} process records as failed: {}",
+            recovered_processes.len(),
+            recovered_processes.join(", ")
+        ));
+    }
     let tool_gateway = Arc::new(RuntimeToolGateway::new(process_manager.clone()));
     let team_comms = RuntimeTeamCommsService::new(
         store.clone(),
@@ -170,6 +183,17 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         },
     )
     .context("failed to initialize worktree service")?;
+    let retried_deferred_deliveries = team_comms
+        .recover_startup_deferred_deliveries()
+        .await
+        .context("failed to recover deferred team deliveries at startup")?;
+    startup_recovery.deferred_deliveries_retried = retried_deferred_deliveries;
+    if retried_deferred_deliveries > 0 {
+        startup_recovery.notes.push(format!(
+            "startup deferred-delivery recovery retried {} queued delivery record(s)",
+            retried_deferred_deliveries
+        ));
+    }
 
     let services = RuntimeServices {
         store: store.clone(),
@@ -205,6 +229,10 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
     app.initialize()
         .await
         .context("runtime initialization failed")?;
+    runtime
+        .emit_startup_recovered_event(&startup_recovery)
+        .await
+        .context("failed to append runtime.startup_recovered event")?;
 
     Ok(BootstrappedRuntime {
         app,
@@ -212,6 +240,7 @@ pub async fn bootstrap_runtime(config: RuntimeServerConfig) -> Result<Bootstrapp
         auth,
         bind_address: config.server.bind_address,
         public_base_url: config.server.public_base_url,
+        startup_recovery,
     })
 }
 
@@ -239,6 +268,8 @@ fn resolve_claude_bridge_launch() -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_core::{ProcessRecord, RuntimeEventScope, RuntimeStore};
+    use runtime_store_sqlite::{SqliteRuntimeStore, SqliteStoreConfig};
 
     #[tokio::test]
     async fn bootstrap_fails_when_all_providers_disabled() {
@@ -288,6 +319,77 @@ mod tests {
         assert_eq!(
             runtime.app.worktree_settings.deletion_policy_default,
             "retain_on_last_claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovered_event_uses_final_bootstrap_summary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = RuntimeServerConfig::default();
+        config.data.root_dir = temp_dir.path().to_path_buf();
+
+        let store = SqliteRuntimeStore::new(SqliteStoreConfig {
+            database_path: config.resolve_sqlite_path(),
+        });
+        store.initialize().await.expect("initialize sqlite store");
+        store
+            .upsert_process(&ProcessRecord {
+                id: "proc_9001".to_string(),
+                session_id: None,
+                tool_call_id: None,
+                pid: Some(12345),
+                command: serde_json::json!({"shell":"echo seeded"}),
+                cwd: None,
+                status: "running".to_string(),
+                exit_code: None,
+                signal: None,
+                stdout_path: None,
+                stderr_path: None,
+                started_at: 1_000,
+                ended_at: None,
+                timeout_ms: None,
+            })
+            .expect("seed running process");
+
+        let runtime = bootstrap_runtime(config).await.expect("bootstrap");
+        let events = runtime
+            .app
+            .services
+            .store
+            .list_runtime_events(
+                Some((RuntimeEventScope::System, "startup_recovery")),
+                None,
+                256,
+            )
+            .expect("list system events");
+        let startup_event = events
+            .iter()
+            .find(|event| event.kind == "runtime.startup_recovered")
+            .cloned()
+            .expect("startup recovered event");
+        let summary = startup_event
+            .payload
+            .get("summary")
+            .cloned()
+            .expect("event summary payload");
+        assert_eq!(
+            summary
+                .get("deferred_deliveries_retried")
+                .and_then(serde_json::Value::as_u64)
+                .expect("deferred_deliveries_retried"),
+            runtime.startup_recovery.deferred_deliveries_retried as u64
+        );
+        let notes = summary
+            .get("notes")
+            .and_then(serde_json::Value::as_array)
+            .expect("summary notes");
+        assert!(
+            notes.iter().any(|note| {
+                note.as_str()
+                    .map(|text| text.contains("startup process recovery marked"))
+                    .unwrap_or(false)
+            }),
+            "startup event summary should include process recovery note from final bootstrap stage"
         );
     }
 

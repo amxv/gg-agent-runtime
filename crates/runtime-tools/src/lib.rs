@@ -66,6 +66,7 @@ pub struct RuntimeProcessManager {
     next_event_id: Arc<AtomicU64>,
     processes: Arc<RwLock<HashMap<String, Arc<ManagedProcess>>>>,
     event_tx: broadcast::Sender<runtime_core::RuntimeEventRecord>,
+    startup_recovered_processes: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +113,7 @@ impl RuntimeProcessManager {
         let mut processes = HashMap::new();
         let mut max_seq = 0_u64;
         let (event_tx, _) = broadcast::channel(16_384);
+        let mut startup_recovered_processes = Vec::new();
 
         for mut record in hydrated.processes {
             if let Some(seq) = parse_process_sequence(record.id.as_str()) {
@@ -120,6 +122,8 @@ impl RuntimeProcessManager {
             if record.status == "running" || record.status == "queued" {
                 record.status = "failed".to_string();
                 record.ended_at = Some(now_ms());
+                store.upsert_process(&record)?;
+                startup_recovered_processes.push(record.id.clone());
             }
             processes.insert(
                 record.id.clone(),
@@ -135,7 +139,12 @@ impl RuntimeProcessManager {
             next_event_id: Arc::new(AtomicU64::new(1)),
             processes: Arc::new(RwLock::new(processes)),
             event_tx,
+            startup_recovered_processes: Arc::new(RwLock::new(startup_recovered_processes)),
         }))
+    }
+
+    pub async fn startup_recovered_processes(&self) -> Vec<String> {
+        self.startup_recovered_processes.read().await.clone()
     }
 
     async fn append_process_event(
@@ -849,6 +858,7 @@ impl Clone for RuntimeProcessManager {
             next_event_id: Arc::clone(&self.next_event_id),
             processes: Arc::clone(&self.processes),
             event_tx: self.event_tx.clone(),
+            startup_recovered_processes: Arc::clone(&self.startup_recovered_processes),
         }
     }
 }
