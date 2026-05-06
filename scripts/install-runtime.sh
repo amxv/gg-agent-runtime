@@ -13,12 +13,14 @@ Arguments:
 
 Environment:
   GG_RUNTIME_REPO          GitHub repo in owner/name form.
-                           If unset, tries git remote origin.
+                           Default: amxv/gg-agent-runtime.
+                           If set, overrides the default.
   GG_RUNTIME_INSTALL_ROOT  Install prefix. Default: ~/.local
 
 Examples:
+  ./scripts/install-runtime.sh latest
+  GG_RUNTIME_INSTALL_ROOT=/opt/gg-runtime ./scripts/install-runtime.sh v0.1.0
   GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
-  GG_RUNTIME_REPO=owner/repo GG_RUNTIME_INSTALL_ROOT=/opt/gg-runtime ./scripts/install-runtime.sh v0.1.0
 EOF
 }
 
@@ -35,17 +37,7 @@ detect_repo() {
     echo "${GG_RUNTIME_REPO}"
     return
   fi
-  if ! command -v git >/dev/null 2>&1; then
-    return
-  fi
-  local remote_url
-  remote_url="$(git config --get remote.origin.url 2>/dev/null || true)"
-  if [[ -z "${remote_url}" ]]; then
-    return
-  fi
-  if [[ "${remote_url}" =~ github.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
-    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-  fi
+  echo "amxv/gg-agent-runtime"
 }
 
 REPO="$(detect_repo || true)"

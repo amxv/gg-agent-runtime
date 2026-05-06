@@ -12,14 +12,20 @@ Treat it as one deployable product even though the internals are split into crat
 1. Install runtime bundle:
 
 ```bash
-GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
+./scripts/install-runtime.sh latest
 ```
 
 or:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/owner/repo/main/scripts/install-runtime.sh | \
-  GG_RUNTIME_REPO=owner/repo bash -s -- latest
+curl -fsSL https://raw.githubusercontent.com/amxv/gg-agent-runtime/main/scripts/install-runtime.sh | \
+  bash -s -- latest
+```
+
+Override the release repo only if you intentionally want a fork:
+
+```bash
+GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
 ```
 
 2. Login providers on the machine:

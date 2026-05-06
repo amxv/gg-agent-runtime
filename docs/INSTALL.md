@@ -10,20 +10,26 @@ Prereqs on host:
 Install latest release to `~/.local`:
 
 ```bash
-GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
+./scripts/install-runtime.sh latest
 ```
 
 Or run directly from GitHub without cloning:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/owner/repo/main/scripts/install-runtime.sh | \
-  GG_RUNTIME_REPO=owner/repo bash -s -- latest
+curl -fsSL https://raw.githubusercontent.com/amxv/gg-agent-runtime/main/scripts/install-runtime.sh | \
+  bash -s -- latest
 ```
 
 Install a pinned version:
 
 ```bash
-GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh v0.1.0
+./scripts/install-runtime.sh v0.1.0
+```
+
+Only set `GG_RUNTIME_REPO` if you want to install from a fork or alternate repo:
+
+```bash
+GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
 ```
 
 Then:

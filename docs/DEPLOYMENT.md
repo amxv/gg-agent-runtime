@@ -53,9 +53,11 @@ For local always-on use, run in `tmux`/`screen` or use a LaunchAgent. Minimal ma
 ## Upgrade
 
 ```bash
-GG_RUNTIME_REPO=owner/repo ./scripts/install-runtime.sh latest
+./scripts/install-runtime.sh latest
 systemctl --user restart gg-runtime.service
 ```
+
+Set `GG_RUNTIME_REPO` only if you intentionally want to upgrade from a forked release source.
 
 ## Security Notes
 
