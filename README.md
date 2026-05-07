@@ -1,5 +1,9 @@
 # GG Runtime
 
+GG Runtime is an air traffic control tower for machine agents, not a chat widget with ambition problems.
+
+That line sounds a little rude, but it is also the cleanest way to explain the repo.
+
 Most agent products start with the wrong center of gravity.
 
 They start in the UI.
@@ -33,6 +37,10 @@ You do not just need "chat with tools." You need:
 - team communication
 - provider-specific quirks hidden behind one contract
 
+Most agent stacks start as frontend demos and accidentally become distributed systems.
+
+GG Runtime skips the accident.
+
 That is the moment this project becomes relevant.
 
 `gg-runtime-server` exists for that moment.
@@ -40,6 +48,8 @@ That is the moment this project becomes relevant.
 It is a standalone runtime you can deploy on a laptop, a VPS, or a dedicated machine, then drive from any frontend over HTTP and SSE.
 
 Instead of burying agent behavior inside your UI, you move the hard part into a machine-side runtime that can persist, recover, stream, and keep working even when the client disappears.
+
+The browser tab is now a remote control, not the engine block.
 
 ## The Story
 
@@ -82,6 +92,8 @@ flowchart TD
 ```
 
 That architecture is fragile. Every new product surface ends up rebuilding the same runtime concerns.
+
+It is the software equivalent of taping a second steering wheel onto the passenger seat and calling it multi-driver support.
 
 This repo takes the opposite approach:
 
@@ -129,6 +141,8 @@ That is the difference between:
 - "our app has an agent feature"
 - and "we have an agent platform we can keep building on"
 
+Provider APIs change. Runtime contracts should not.
+
 ## What The Runtime Actually Owns
 
 `gg-runtime-server` is the control plane for agent work on a machine.
@@ -148,6 +162,8 @@ It owns:
 The UI does not need to know how Codex auth is staged, how Claude is bridged, how provider quirks are normalized, or how a worktree is claimed. It just speaks HTTP and SSE.
 
 That boundary is what makes the architecture reusable.
+
+If your agents can mutate repos and spawn processes, the machine is the product boundary. This repo just stops pretending otherwise.
 
 ## Mental Model
 
@@ -184,6 +200,8 @@ The important boundary is between the client and the runtime, not between the cl
 
 That sounds subtle, but it changes everything. Once that boundary is real, your frontend stops owning orchestration logic it was never meant to carry.
 
+Different engine rooms, same cockpit instruments.
+
 ## What You Get
 
 ### One runtime model across providers
@@ -205,6 +223,8 @@ Those providers are normalized into one shared model for:
 That matters because frontends should not have to learn different lifecycle semantics per provider.
 
 The provider layer should be replaceable. The runtime contract should be stable.
+
+Codex and Claude are different dialects. The runtime is the interpreter with a durable transcript.
 
 ### Durable, replayable sessions
 
@@ -233,6 +253,46 @@ It is much closer to a control plane than a chatbot server.
 
 That is the right mental category for this repo.
 
+Or, if you prefer the less polite version: it is Kubernetes for agent turns, but with receipts.
+
+The receipts matter. SQLite stores the event log, scoped sequencing, delivery states, and recovery metadata, which means the runtime can explain what happened instead of shrugging in JSON.
+
+The browser reconnects. The runtime remembers.
+
+### A real native multi-agent layer
+
+This is one of the most interesting parts of the repo.
+
+The runtime does not just let one user talk to one model. It has a native agent layer where agents can:
+
+- message other agents
+- supervise other agents
+- interrupt or defer messages based on policy
+- spawn teammates
+- claim worktrees
+- coordinate live work across one shared runtime
+
+And it does that without caring whether a given agent is running on Codex or Claude.
+
+That is a bigger deal than it sounds.
+
+Most systems treat agent collaboration like theater. A bunch of personas, some prompts, and good luck.
+
+This repo treats it like transport infrastructure.
+
+Agent-to-agent messaging is modeled like delivery infrastructure:
+
+- policy
+- queueing
+- retries
+- cancellation
+- replay
+- audit events
+
+So the system is not just "agents talking." It is agents talking with timing rules, interruption rules, delivery states, deferred injection, and receipts.
+
+That is how you turn multi-agent behavior from roleplay into operations.
+
 ### A deployable product boundary
 
 The runtime ships as one bundle:
@@ -244,6 +304,8 @@ The runtime ships as one bundle:
 That bundle is the backend product. Your UI is not where the business logic has to live anymore.
 
 If you are building multiple agent applications, or even one serious one, that separation pays for itself fast.
+
+Your frontend is Slack. This runtime is the message bus plus scheduler plus incident log.
 
 ## Architecture
 
@@ -275,6 +337,10 @@ flowchart LR
 ```
 
 They keep unstable or provider-specific behavior isolated behind stable process boundaries.
+
+That is boring in exactly the right way.
+
+You want the provider weirdness and MCP weirdness in boxes with labels, not leaking into the whole runtime like a kitchen sink backing up into the living room.
 
 ## Quick Start
 
@@ -358,6 +424,8 @@ This is the design goal in one sentence: your application should talk to a runti
 
 That keeps your frontend simpler, your backend more honest, and your system much easier to evolve.
 
+Team orchestration is already a first-class runtime API here. The MCP-facing team/tool surface is still evolving toward full parity, and it is worth being honest about that. The right story is not "everything is magically unified already." The right story is "the runtime contract is real, and the remaining surface area is being pulled into it on purpose."
+
 ## Auth Model
 
 - Codex: machine login via `codex login`, with staged runtime auth support from `~/.gg/codex/auth.json`
@@ -429,3 +497,9 @@ It includes:
 The obvious next step is not "make another backend." The obvious next step is to build better clients on top of this one.
 
 If this project works, it should make future agent applications feel lighter, because the heavy machinery already lives here.
+
+That is the real appeal of the project.
+
+Not "look, it streams tokens."
+
+More like: "look, the architecture finally stopped lying."
