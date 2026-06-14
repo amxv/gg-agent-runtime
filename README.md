@@ -1,6 +1,6 @@
-# GG Runtime
+# gooselake
 
-GG Runtime is an air traffic control tower for machine agents, not a chat widget with ambition problems.
+gooselake is an air traffic control tower for machine agents, not a chat widget with ambition problems.
 
 That line sounds a little rude, but it is also the cleanest way to explain the repo.
 
@@ -39,7 +39,7 @@ You do not just need "chat with tools." You need:
 
 Most agent stacks start as frontend demos and accidentally become distributed systems.
 
-GG Runtime skips the accident.
+gooselake skips the accident.
 
 That is the moment this project becomes relevant.
 
@@ -104,7 +104,7 @@ flowchart LR
   UI3[CLI]
   UI4[Ops Console]
 
-  UI1 --> Runtime[GG Runtime]
+  UI1 --> Runtime[gooselake]
   UI2 --> Runtime
   UI3 --> Runtime
   UI4 --> Runtime
@@ -431,7 +431,7 @@ Simple shape:
 ```mermaid
 sequenceDiagram
   participant UI as Frontend
-  participant RT as GG Runtime
+  participant RT as gooselake
   participant P as Provider
   participant DB as SQLite
 
